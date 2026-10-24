@@ -38,6 +38,31 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: .\tools\package_windows.ps1 -SkipBuild
+      - name: Install Inno Setup compiler
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        run: python tools/build_installer.py --skip-portable
+      - name: Test Windows runtime checks
+        if: runner.os == 'Windows'
+        run: python tools/test_installer.py
+      - name: Test Windows installation lifecycle
+        if: runner.os == 'Windows'
+        run: python tools/test_installation.py
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MemRW3-Windows-Setup
+          path: |
+            dist/installer/*.exe
+            dist/installer/*.sha256
       - name: Upload Windows portable archive
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
