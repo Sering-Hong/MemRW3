@@ -1,0 +1,4 @@
+Tool: built-in image_gen (not CLI). Generated 2026-10-20.
+
+Final prompt:
+Use case: logo-brand. Asset type: polished Windows desktop application icon for MemRW3 embedded variable and waveform monitoring. Create one square app icon, centered, no text. A beautiful rose pink and soft blush rounded-square tile with subtle glossy enamel depth, on transparent background outside the rounded square. Inside the tile, an elegant white microchip outline with four short pins on each side, and a bold clean white oscilloscope waveform running through the chip center; a tiny soft coral accent. Balanced sophisticated modern desktop software aesthetic, minimal forms, strong silhouette, readable at 32 pixels, crisp smooth edges. Tile occupies 88 percent of image with generous transparent outer margin. Front-facing orthographic icon, no mockup, no letters, no watermark, no extra objects.

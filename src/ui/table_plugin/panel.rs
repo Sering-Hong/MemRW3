@@ -24,6 +24,8 @@ pub struct TablePluginState {
     pending_svd_actions: Vec<PluginAction>,
     errors: Vec<String>,
     svd: SvdPanelState,
+    filter: String,
+    show_svd: bool,
 }
 
 impl Default for TablePluginState {
@@ -37,6 +39,8 @@ impl Default for TablePluginState {
             pending_svd_actions: Vec::new(),
             errors: Vec::new(),
             svd: SvdPanelState::default(),
+            filter: String::new(),
+            show_svd: false,
         }
     }
 }
@@ -44,6 +48,8 @@ impl Default for TablePluginState {
 #[derive(Serialize, Deserialize)]
 struct SavedTableConfig {
     roots: Vec<SavedTableNode>,
+    #[serde(default)]
+    show_svd: bool,
     #[serde(default)]
     svd_path: Option<String>,
     #[serde(default)]
@@ -70,7 +76,7 @@ impl MemRWPlugin for TablePluginState {
     }
 
     fn title(&self) -> &'static str {
-        "Table 变量与寄存器"
+        "Watch 表格式变量查看器"
     }
 
     fn viewport_size(&self) -> egui::Vec2 {
@@ -180,6 +186,7 @@ impl MemRWPlugin for TablePluginState {
     fn save_config(&self, pool: &VariablePool) -> serde_json::Value {
         let config = SavedTableConfig {
             roots: self.roots.iter().map(|root| root.to_saved(pool)).collect(),
+            show_svd: self.show_svd,
             svd_path: self.svd.path().map(|path| path.display().to_string()),
             svd_registers: self.svd.saved_registers(),
         };
@@ -195,6 +202,7 @@ impl MemRWPlugin for TablePluginState {
             serde_json::from_value(payload.clone()).map_err(|error| error.to_string())?;
         let (saved_roots, svd_path, svd_registers) = match payload {
             SavedTablePayload::Current(config) => {
+                self.show_svd = config.show_svd;
                 (config.roots, config.svd_path, config.svd_registers)
             }
             SavedTablePayload::Legacy(entries) => (
@@ -236,6 +244,13 @@ impl MemRWPlugin for TablePluginState {
 }
 
 fn table_panel(ui: &mut Ui, state: &mut TablePluginState, pool: &VariablePool) -> bool {
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut state.show_svd, "显示 SVD 寄存器");
+        ui.label(RichText::new("变量表可 Pop out，与曲线同时查看").color(theme::muted_text(ui)));
+    });
+    if !state.show_svd {
+        return render_variable_panel(ui, state, pool);
+    }
     let mut open_tree = false;
     egui::Panel::left("table_variable_panel")
         .resizable(true)
@@ -268,21 +283,23 @@ fn render_variable_panel(ui: &mut Ui, state: &mut TablePluginState, pool: &Varia
             );
         });
     });
-    ui.horizontal(|ui| {
-        ui.add_space(38.0);
-        ui.add_sized(
-            [180.0, 18.0],
-            egui::Label::new(RichText::new("名称").strong()),
+    ui.horizontal_wrapped(|ui| {
+        ui.label("搜索:");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.filter)
+                .hint_text("变量名称 / 地址")
+                .desired_width(260.0),
         );
-        ui.add_sized(
-            [135.0, 18.0],
-            egui::Label::new(RichText::new("当前值").strong()),
-        );
-        ui.add_sized(
-            [75.0, 18.0],
-            egui::Label::new(RichText::new("刷新频率").strong()),
-        );
-        ui.label(RichText::new("写入").strong());
+        if ui.button("展开全部").clicked() {
+            for root in &mut state.roots {
+                set_expanded(root, true);
+            }
+        }
+        if ui.button("折叠全部").clicked() {
+            for root in &mut state.roots {
+                set_expanded(root, false);
+            }
+        }
     });
     ui.separator();
 
@@ -302,26 +319,66 @@ fn render_variable_panel(ui: &mut Ui, state: &mut TablePluginState, pool: &Varia
         .id_salt("table_variable_tree_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for (index, root) in state.roots.iter_mut().enumerate() {
-                if render_node(
-                    ui,
-                    root,
-                    0,
-                    true,
-                    pool,
-                    &mut state.pending_enabled,
-                    &mut state.pending_writes,
-                    &mut state.errors,
-                ) {
-                    remove_root = Some(index);
-                }
-            }
+            egui::Grid::new("watch_variable_grid")
+                .num_columns(8)
+                .striped(true)
+                .spacing([12.0, 5.0])
+                .min_row_height(24.0)
+                .show(ui, |ui| {
+                    for heading in [
+                        "采集",
+                        "名称 / 表达式",
+                        "类型",
+                        "地址",
+                        "当前值",
+                        "刷新频率",
+                        "写入值",
+                        "操作",
+                    ] {
+                        ui.label(RichText::new(heading).strong());
+                    }
+                    ui.end_row();
+                    let filter = state.filter.trim().to_lowercase();
+                    for (index, root) in state.roots.iter_mut().enumerate() {
+                        if render_node(
+                            ui,
+                            root,
+                            0,
+                            true,
+                            pool,
+                            &mut state.pending_enabled,
+                            &mut state.pending_writes,
+                            &mut state.errors,
+                            &filter,
+                        ) {
+                            remove_root = Some(index);
+                        }
+                    }
+                });
         });
     if let Some(index) = remove_root {
         let root = state.roots.remove(index);
         root.collect_removals(&mut state.pending_removals);
     }
     open_tree
+}
+
+fn set_expanded(node: &mut TableNode, expanded: bool) {
+    node.expanded = expanded;
+    for child in &mut node.children {
+        set_expanded(child, expanded);
+    }
+}
+
+fn matches_filter(node: &TableNode, filter: &str) -> bool {
+    filter.is_empty()
+        || node.label.to_lowercase().contains(filter)
+        || node.source_name.to_lowercase().contains(filter)
+        || format!("0x{:x}", node.source_address).contains(filter)
+        || node
+            .children
+            .iter()
+            .any(|child| matches_filter(child, filter))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -334,99 +391,121 @@ fn render_node(
     enabled_changes: &mut Vec<(usize, bool)>,
     pending_writes: &mut Vec<(usize, u64)>,
     errors: &mut Vec<String>,
+    filter: &str,
 ) -> bool {
+    if !matches_filter(node, filter) {
+        return false;
+    }
     let mut remove = false;
-    ui.horizontal(|ui| {
-        ui.add_space(depth as f32 * 16.0);
-        if node.children.is_empty() {
-            ui.add_space(20.0);
-        } else if ui
-            .small_button(if node.expanded { "▼" } else { "▶" })
-            .clicked()
-        {
-            node.expanded = !node.expanded;
+    if let Some(leaf) = &mut node.leaf {
+        if ui.checkbox(&mut leaf.enabled, "").changed() {
+            enabled_changes.push((leaf.variable_id, leaf.enabled));
         }
-
-        if let Some(leaf) = &mut node.leaf {
-            let response = ui.checkbox(&mut leaf.enabled, "");
-            if response.changed() {
-                enabled_changes.push((leaf.variable_id, leaf.enabled));
-            }
-        } else {
-            let (symbol, enabled) = match node.check_state() {
-                CheckState::All => ("☑", true),
-                CheckState::Partial => ("▣", true),
-                CheckState::None => ("☐", true),
-                CheckState::Unavailable => ("—", false),
-            };
-            if ui
-                .add_enabled(enabled, egui::Button::new(symbol).frame(false))
+    } else {
+        let check = node.check_state();
+        let mut enabled = check == CheckState::All;
+        if ui
+            .add_enabled(
+                check != CheckState::Unavailable,
+                egui::Checkbox::new(&mut enabled, "").indeterminate(check == CheckState::Partial),
+            )
+            .changed()
+        {
+            node.set_enabled_recursive(enabled, enabled_changes);
+        }
+    }
+    ui.allocate_ui_with_layout(
+        egui::vec2(260.0, 24.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add_space((depth as f32 * 16.0).min(160.0));
+            if node.children.is_empty() {
+                ui.add_space(22.0);
+            } else if ui
+                .add_sized(
+                    [20.0, 20.0],
+                    egui::Button::new(if node.expanded || !filter.is_empty() {
+                        "-"
+                    } else {
+                        "+"
+                    }),
+                )
                 .clicked()
             {
-                let target = node.check_state() != CheckState::All;
-                node.set_enabled_recursive(target, enabled_changes);
+                node.expanded = !node.expanded;
             }
-        }
-
-        let name_response = ui.add_sized(
-            [180.0 - (depth as f32 * 8.0).min(80.0), 20.0],
-            egui::Label::new(&node.label).truncate(),
+            ui.add(egui::Label::new(&node.label).truncate())
+                .on_hover_text(&node.source_name);
+        },
+    );
+    let variable = node
+        .leaf
+        .as_ref()
+        .and_then(|leaf| pool.get(leaf.variable_id));
+    ui.label(
+        variable
+            .map(|v| crate::dwarf::types::extend_type_label(&v.ext_type))
+            .unwrap_or("结构 / 数组"),
+    );
+    ui.monospace(format!(
+        "0x{:08X}",
+        variable.map(|v| v.address).unwrap_or(node.source_address)
+    ));
+    let mut write = false;
+    if let Some(leaf) = &mut node.leaf {
+        ui.add_sized(
+            [180.0, 22.0],
+            egui::Label::new(RichText::new(&leaf.current_value).monospace())
+                .halign(egui::Align::Min)
+                .truncate(),
+        )
+        .on_hover_text(&leaf.current_value);
+        ui.add(
+            egui::DragValue::new(&mut leaf.refresh_hz)
+                .range(1..=60)
+                .suffix(" Hz"),
+        )
+        .on_hover_text("当前值显示刷新频率，不改变底层采集率");
+        let edit = ui.add_sized(
+            [110.0, 22.0],
+            egui::TextEdit::singleline(&mut leaf.edit_buffer)
+                .id(egui::Id::new(("table_write", node.id)))
+                .desired_width(100.0)
+                .font(egui::TextStyle::Monospace),
         );
-        name_response.on_hover_text(format!(
-            "{} @ 0x{:X}",
-            node.source_name, node.source_address
-        ));
-
-        if let Some(leaf) = &mut node.leaf {
-            ui.add_sized(
-                [135.0, 20.0],
-                egui::Label::new(RichText::new(&leaf.current_value).monospace().size(11.0))
-                    .truncate(),
-            );
-            ui.add_sized(
-                [75.0, 20.0],
-                egui::DragValue::new(&mut leaf.refresh_hz)
-                    .range(1..=60)
-                    .speed(1)
-                    .suffix(" Hz"),
-            )
-            .on_hover_text("仅控制 Table 当前值文本的刷新频率，不改变底层采集率");
-            ui.add(
-                egui::TextEdit::singleline(&mut leaf.edit_buffer)
-                    .id(egui::Id::new(("table_write", node.id)))
-                    .desired_width(72.0)
-                    .font(egui::TextStyle::Monospace),
-            );
-            if ui.small_button("写").clicked() {
-                if let Some(variable) = pool.get(leaf.variable_id) {
-                    match validate_write(&leaf.edit_buffer, &variable.ext_type) {
-                        Ok(value) => pending_writes.push((leaf.variable_id, value)),
-                        Err(error) => errors.push(error),
-                    }
-                }
-            }
-        } else {
-            ui.add_sized(
-                [135.0, 20.0],
-                egui::Label::new(
-                    RichText::new(format!("{} 个变量", node.leaf_count()))
-                        .size(10.5)
-                        .color(theme::muted_text(ui)),
-                ),
-            );
-            ui.add_space(75.0);
+        write = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    } else {
+        ui.label(format!("{} 个变量", node.leaf_count()));
+        ui.label("");
+        ui.label("");
+    }
+    ui.horizontal(|ui| {
+        if node.leaf.is_some() {
+            write |= ui.small_button("写入").clicked();
         }
-
-        if is_root
-            && ui
-                .small_button(RichText::new("删除").color(theme::danger_text(ui)))
-                .clicked()
-        {
+        if is_root && ui.small_button("删除").clicked() {
             remove = true;
         }
     });
-
-    if node.expanded {
+    if write {
+        if let (Some(leaf), Some(variable)) = (&node.leaf, variable) {
+            match validate_write(&leaf.edit_buffer, &variable.ext_type) {
+                Ok(value) => pending_writes.push((leaf.variable_id, value)),
+                Err(error) => errors.push(error),
+            }
+        }
+    }
+    ui.end_row();
+    if node.expanded || !filter.is_empty() {
+        // Matching a parent shows its entire subtree; matching a child reveals its ancestors.
+        let child_filter = if node.label.to_lowercase().contains(filter)
+            || node.source_name.to_lowercase().contains(filter)
+            || format!("0x{:x}", node.source_address).contains(filter)
+        {
+            ""
+        } else {
+            filter
+        };
         for child in &mut node.children {
             render_node(
                 ui,
@@ -437,6 +516,7 @@ fn render_node(
                 enabled_changes,
                 pending_writes,
                 errors,
+                child_filter,
             );
         }
     }
@@ -544,6 +624,74 @@ fn format_value_into(data: &[u8], ext_type: &ExtendType, output: &mut String) {
 mod tests {
     use super::{SavedTablePayload, validate_write};
     use crate::dwarf::types::ExtendType;
+
+    #[test]
+    fn watch_filter_reveals_matching_children_and_addresses() {
+        use crate::ui::plugin::VariableCandidate;
+        let child = VariableCandidate {
+            label: "speed".to_owned(),
+            name: "motor.speed".to_owned(),
+            address: 0x2000_0004,
+            ext_type: ExtendType::Float,
+            size: 4,
+            children: Vec::new(),
+        };
+        let parent = VariableCandidate {
+            label: "motor".to_owned(),
+            name: "motor".to_owned(),
+            address: 0x2000_0000,
+            ext_type: ExtendType::Other,
+            size: 8,
+            children: vec![child],
+        };
+        let mut pool = crate::model::VariablePool::default();
+        let mut id = 1;
+        let mut node =
+            super::TableNode::from_candidate(&parent, "电机".to_owned(), &mut pool, &mut id)
+                .unwrap();
+        assert!(super::matches_filter(&node, "speed"));
+        assert!(super::matches_filter(&node, "0x20000004"));
+        assert!(!super::matches_filter(&node, "missing"));
+        super::set_expanded(&mut node, false);
+        assert!(!node.expanded && !node.children[0].expanded);
+        assert!(super::matches_filter(&node, "speed"));
+    }
+
+    #[test]
+    fn watch_table_renders_scalar_rows_without_hardware() {
+        use crate::ui::plugin::VariableCandidate;
+        let mut state = super::TablePluginState::default();
+        let mut pool = crate::model::VariablePool::default();
+        for index in 0..3 {
+            let candidate = VariableCandidate {
+                label: format!("value_{index}"),
+                name: format!("value_{index}"),
+                address: 0x2000_0000 + index * 4,
+                ext_type: ExtendType::Float,
+                size: 4,
+                children: Vec::new(),
+            };
+            state.roots.push(
+                super::TableNode::from_candidate(
+                    &candidate,
+                    candidate.label.clone(),
+                    &mut pool,
+                    &mut state.next_node_id,
+                )
+                .unwrap(),
+            );
+        }
+        let ctx = eframe::egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
+                eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                    super::table_panel(ui, &mut state, &pool);
+                });
+            });
+        }
+        assert!(state.pending_writes.is_empty());
+        assert_eq!(state.roots.len(), 3);
+    }
 
     #[test]
     fn validates_integer_write_ranges() {

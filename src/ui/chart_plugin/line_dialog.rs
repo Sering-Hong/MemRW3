@@ -32,13 +32,19 @@ pub fn line_dialog_ui(
             ui.label("颜色:");
             color_pick(ui, color);
             ui.end_row();
-            ui.label("缓冲区:");
+            ui.label("历史保留:");
             ui.add_enabled_ui(!running, |ui| {
-                ui.add(
-                    egui::Slider::new(buffer_size, 1000..=50000)
-                        .step_by(1000.0)
-                        .text("points"),
-                );
+                let mut retain_all = *buffer_size == 0;
+                if ui.checkbox(&mut retain_all, "保留全部采样").changed() {
+                    *buffer_size = if retain_all { 0 } else { 5000 };
+                }
+                if !retain_all {
+                    ui.add(
+                        egui::Slider::new(buffer_size, 1000..=50000)
+                            .step_by(1000.0)
+                            .text("点"),
+                    );
+                }
             });
             ui.end_row();
             ui.label("可见:");

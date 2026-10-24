@@ -12,11 +12,14 @@ use crate::app::MemRW3App;
 
 fn main() -> Result<()> {
     let dwarf_state = dwarf::types::DwarfState::new(Vec::new());
+    let window_icon =
+        eframe::icon_data::from_png_bytes(include_bytes!("../assets/MemRW3-pink.png"))?;
 
     eframe::run_native(
         "MemRW3 - Memory Read/Write Monitor",
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
+                .with_icon(window_icon)
                 .with_inner_size([1280.0, 720.0])
                 .with_min_inner_size([800.0, 500.0]),
             ..Default::default()

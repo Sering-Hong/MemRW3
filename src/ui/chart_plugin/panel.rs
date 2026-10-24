@@ -113,7 +113,7 @@ impl Default for ChartPluginState {
             reset_timer: false,
             edit_curve_name: String::new(),
             edit_color: Color32::WHITE,
-            edit_buffer_size: 10000,
+            edit_buffer_size: 0,
             edit_visible: true,
             log_file: None,
             log_writer: None,
@@ -181,6 +181,8 @@ struct SavedChartLegend {
     color: [u8; 4],
     visible: bool,
     buffer_size: usize,
+    #[serde(default = "default_retain_all")]
+    retain_all: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -201,6 +203,10 @@ enum SavedChartPayload {
 
 fn default_point_marker_threshold() -> usize {
     DEFAULT_POINT_MARKER_THRESHOLD
+}
+
+fn default_retain_all() -> bool {
+    true
 }
 
 impl MemRWPlugin for ChartPluginState {
@@ -352,6 +358,7 @@ impl MemRWPlugin for ChartPluginState {
                     ],
                     visible: legend.visible,
                     buffer_size: legend.buffer_size,
+                    retain_all: legend.buffer_size == 0,
                 }
             })
             .collect();
@@ -411,7 +418,11 @@ impl MemRWPlugin for ChartPluginState {
                 saved.color[3],
             );
             legend.visible = saved.visible;
-            legend.buffer_size = saved.buffer_size;
+            legend.buffer_size = if saved.retain_all {
+                0
+            } else {
+                saved.buffer_size
+            };
             self.legends.push(legend);
             pool.bind(var_id, true, VariableReadClass::Stream);
         }
@@ -572,7 +583,7 @@ pub fn chart_panel(
             });
             ui.add_space(2.0);
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("清空").clicked() {
                     for legend in &mut state.legends {
                         legend.data_history.clear();
@@ -584,6 +595,15 @@ pub fn chart_panel(
                     state.reset_timer = true;
                 }
                 if ui.button("回到最新").clicked() {
+                    state.auto_scroll = true;
+                    state.td_plot_bounds = None;
+                }
+                if ui
+                    .button("查看全部")
+                    .on_hover_text("显示从开始到现在的全部曲线")
+                    .clicked()
+                {
+                    state.x_mode = XAxisMode::Auto;
                     state.auto_scroll = true;
                     state.td_plot_bounds = None;
                 }
@@ -733,6 +753,19 @@ pub fn chart_panel(
                 });
             });
             ui.add_space(2.0);
+            let points: usize = state.legends.iter().map(|l| l.data_history.len()).sum();
+            let history = if state.legends.iter().all(|l| l.buffer_size == 0) {
+                "完整历史"
+            } else {
+                "部分曲线使用限长缓冲"
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{history} · 已保留 {points} 点 · 暂停后保留，清空后重新记录"
+                ))
+                .size(11.0)
+                .color(theme::muted_text(ui)),
+            );
 
             if state.legends.is_empty() {
                 ui.vertical_centered(|ui| {
@@ -833,9 +866,8 @@ pub fn chart_panel(
                             legend.visible = state.edit_visible;
                             if legend.buffer_size != state.edit_buffer_size {
                                 legend.buffer_size = state.edit_buffer_size;
-                                legend.data_history = std::collections::VecDeque::with_capacity(
-                                    state.edit_buffer_size,
-                                );
+                                legend.prepare_batch(0);
+                                legend.refresh_plot_bridge();
                             }
                         }
                     }
@@ -985,29 +1017,26 @@ fn render_chart(ui: &mut Ui, state: &mut ChartPluginState) {
                 if !legend.visible || legend.data_history.len() < 2 {
                     continue;
                 }
-                let (first, second) = legend.data_history.as_slices();
+                let bounds = if state.auto_scroll {
+                    auto_bounds
+                } else {
+                    state.td_plot_bounds
+                };
+                let (x_min, x_max) = bounds
+                    .map(|b| (b.0, b.1))
+                    .unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
+                let points = history_plot_points(
+                    &legend.data_history,
+                    x_min,
+                    x_max,
+                    (plot_rect.width().max(100.0) as usize) * 4,
+                );
                 plot_ui.line(
-                    Line::new(legend.curve_name.clone(), PlotPoints::Borrowed(first))
+                    Line::new(legend.curve_name.clone(), PlotPoints::Owned(points))
                         .id(egui::Id::new(("chart_line", legend_index, 0)))
                         .color(legend.color)
                         .width(1.5),
                 );
-                if let Some(bridge) = legend.plot_bridge.as_ref() {
-                    plot_ui.line(
-                        Line::new(legend.curve_name.clone(), PlotPoints::Borrowed(bridge))
-                            .id(egui::Id::new(("chart_line", legend_index, 1)))
-                            .color(legend.color)
-                            .width(1.5),
-                    );
-                }
-                if !second.is_empty() {
-                    plot_ui.line(
-                        Line::new(legend.curve_name.clone(), PlotPoints::Borrowed(second))
-                            .id(egui::Id::new(("chart_line", legend_index, 2)))
-                            .color(legend.color)
-                            .width(1.5),
-                    );
-                }
             }
 
             if let Some(cursor) = plot_ui.pointer_coordinate() {
@@ -1435,6 +1464,48 @@ fn compute_scroll_zoom(
     }
 }
 
+/// Reduce only the drawn copy, keeping first/last and each bucket's extrema.
+/// The acquisition history, cursor lookup, CSV and FFT retain the original samples.
+fn history_plot_points(
+    data: &std::collections::VecDeque<PlotPoint>,
+    x_min: f64,
+    x_max: f64,
+    budget: usize,
+) -> Vec<PlotPoint> {
+    let start = data.partition_point(|p| p.x < x_min).saturating_sub(1);
+    let end = (data.partition_point(|p| p.x <= x_max) + 1).min(data.len());
+    if start >= end {
+        return Vec::new();
+    }
+    let count = end - start;
+    if count <= budget.max(4) {
+        return data.range(start..end).copied().collect();
+    }
+    let buckets = (budget.max(4) - 2) / 2;
+    let chunk = (count - 2).div_ceil(buckets);
+    let mut points = Vec::with_capacity(budget.max(4));
+    points.push(data[start]);
+    for from in (start + 1..end - 1).step_by(chunk) {
+        let to = (from + chunk).min(end - 1);
+        let mut min = from;
+        let mut max = from;
+        for index in from + 1..to {
+            if data[index].y < data[min].y {
+                min = index;
+            }
+            if data[index].y > data[max].y {
+                max = index;
+            }
+        }
+        points.push(data[min.min(max)]);
+        if min != max {
+            points.push(data[min.max(max)]);
+        }
+    }
+    points.push(data[end - 1]);
+    points
+}
+
 fn visible_history_bounds(legends: &[ChartLegend]) -> Option<(f64, f64, f64, f64)> {
     let mut x_min = f64::INFINITY;
     let mut x_max = f64::NEG_INFINITY;
@@ -1772,6 +1843,42 @@ mod tests {
             array_index: None,
             array_count: None,
         })
+    }
+
+    #[test]
+    fn long_capture_drawing_preserves_endpoints_and_spikes() {
+        let data = (0..100_000)
+            .map(|i| {
+                egui_plot::PlotPoint::new(
+                    i as f64,
+                    if i == 12_345 {
+                        999.0
+                    } else if i == 54_321 {
+                        -777.0
+                    } else {
+                        0.0
+                    },
+                )
+            })
+            .collect();
+        let points = super::history_plot_points(&data, 0.0, 99_999.0, 800);
+        assert!(points.len() <= 800);
+        assert_eq!(points.first().unwrap().x, 0.0);
+        assert_eq!(points.last().unwrap().x, 99_999.0);
+        assert!(points.iter().any(|p| p.y == 999.0));
+        assert!(points.iter().any(|p| p.y == -777.0));
+        assert!(points.windows(2).all(|p| p[0].x < p[1].x));
+        assert_eq!(data.len(), 100_000);
+        let zoom = super::history_plot_points(&data, 100.0, 110.0, 800);
+        assert_eq!(zoom.len(), 13);
+    }
+
+    #[test]
+    fn old_chart_settings_default_to_complete_history() {
+        let old = serde_json::json!({"variable_name":"test", "variable_address":4096,
+            "curve_name":"test", "color":[0,0,0,255], "visible":true,"buffer_size":5000});
+        let saved: super::SavedChartLegend = serde_json::from_value(old).unwrap();
+        assert!(saved.retain_all);
     }
 
     #[test]

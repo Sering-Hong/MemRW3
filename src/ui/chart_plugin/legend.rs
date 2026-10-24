@@ -21,7 +21,7 @@ impl ChartLegend {
             curve_name,
             color: default_color(variable_id),
             visible: true,
-            buffer_size: 5000,
+            buffer_size: 0, // Zero means retain the complete acquisition history.
             data_history: VecDeque::with_capacity(5000),
             plot_bridge: None,
         }
@@ -31,8 +31,7 @@ impl ChartLegend {
     /// samples can be skipped because they would be evicted immediately.
     pub fn prepare_batch(&mut self, incoming_len: usize) -> usize {
         if self.buffer_size == 0 {
-            self.data_history.clear();
-            return incoming_len;
+            return 0;
         }
 
         if incoming_len >= self.buffer_size {
@@ -52,7 +51,7 @@ impl ChartLegend {
     }
 
     pub fn push_prepared(&mut self, time: f64, value: f64) {
-        debug_assert!(self.data_history.len() < self.buffer_size);
+        debug_assert!(self.buffer_size == 0 || self.data_history.len() < self.buffer_size);
         self.data_history.push_back(PlotPoint::new(time, value));
     }
 
@@ -94,6 +93,21 @@ mod tests {
     use egui_plot::PlotPoint;
 
     use super::ChartLegend;
+
+    #[test]
+    fn retains_a_full_capture_beyond_the_old_limit() {
+        let mut legend = ChartLegend::new(0, "full capture".to_owned());
+        for batch in 0..120 {
+            assert_eq!(legend.prepare_batch(1000), 0);
+            for offset in 0..1000 {
+                let time = (batch * 1000 + offset) as f64 / 1000.0;
+                legend.push_prepared(time, time);
+            }
+        }
+        assert_eq!(legend.data_history.len(), 120_000);
+        assert_eq!(legend.data_history.front().unwrap().x, 0.0);
+        assert_eq!(legend.data_history.back().unwrap().x, 119.999);
+    }
 
     #[test]
     fn prepares_space_for_a_batch_once() {

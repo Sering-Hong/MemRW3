@@ -1,32 +1,54 @@
-name: Rust
+name: Build and test
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [main, master]
   pull_request:
-    branches: [ "master" ]
+    branches: [main, master]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     strategy:
       matrix:
         os: [ubuntu-24.04, windows-latest]
-
     runs-on: ${{ matrix.os }}
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --release --verbose
-    - name: Run tests
-      run: cargo test --release --verbose
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: MemRW3-${{ matrix.os }}
-        path: target/release/MemRW3${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libudev-dev libusb-1.0-0-dev libx11-dev libxkbcommon-dev libwayland-dev libssl-dev
+      - name: Install current stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --release --locked
+      - name: Package Windows portable edition
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\tools\package_windows.ps1 -SkipBuild
+      - name: Upload Windows portable archive
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MemRW3-Windows-Enhanced-Pink
+          path: |
+            dist/MemRW3-windows.zip
+            dist/MemRW3-windows.zip.sha256
+      - name: Upload Linux binary
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MemRW3-Linux
+          path: target/release/MemRW3
