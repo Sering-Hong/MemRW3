@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 function Invoke-Native {
     param([string]$FilePath, [string[]]$Arguments, [switch]$Capture)
-    $command = Get-Command -Name $FilePath -CommandType Application -ErrorAction Stop
+    $command = Get-Command -Name $FilePath -CommandType Application -ErrorAction Stop | Select-Object -First 1
     $quoted = $Arguments | ForEach-Object {
         '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
     }
