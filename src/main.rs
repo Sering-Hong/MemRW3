@@ -1,4 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod ai_readonly;
+mod ai_write;
 mod app;
 mod dwarf;
 #[cfg(target_os = "windows")]
@@ -23,7 +25,7 @@ fn main() -> Result<()> {
         eframe::icon_data::from_png_bytes(include_bytes!("../assets/MemRW3-pink.png"))?;
 
     eframe::run_native(
-        "MemRW3 - Memory Read/Write Monitor",
+        "MemRW3 - Codex 参数调试",
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_icon(window_icon)
@@ -33,7 +35,9 @@ fn main() -> Result<()> {
         },
         Box::new(move |cc| {
             app::setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(MemRW3App::new(dwarf_state, cc.egui_ctx.clone())))
+            let mut app = MemRW3App::new(dwarf_state, cc.egui_ctx.clone());
+            app.start_ai_interface(&cc.egui_ctx);
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow!("{}", e))?;

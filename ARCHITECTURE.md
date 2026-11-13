@@ -310,3 +310,55 @@ ELF。重新连接不会自动启动调试；用户选择 Attach 或 Reset 并�
 - DebugPlugin 从 DWARF line program 构建工程源码树；构建机路径不可用时，可将
   DWARF 公共根目录映射到本机源码根目录。
 - 没有物理 Probe 时只能执行纯逻辑和 UI 测试，硬件功能需在目标板上验证。
+
+## Codex 只读数据出口
+
+`ai_readonly::ReadService` 仅监听本机随机端口，认证后将四类只读查询送至有界队列并唤醒 egui。主线程在插件更新后处理查询，从 VariablePool 已发布值和插件只读视图生成响应。读取请求不产生 PluginAction 或 ProbeCommand，不新增硬件采样；受控写入分支见下节。
+
+`MemRWPlugin::readonly_annotations` 提供 Table 名称/注释，`readonly_history` 提供 Chart 限量历史，默认均为空，Debug 不额外导出。ReadState 记录主机观察时间与发布序列；首见旧 LatestValue 不证明新鲜度；禁用 Table 后的新 stream 值不会被旧 LatestValue 覆盖。
+
+Python 标准库桥接程序把 MCP stdio 工具调用转换为上述认证查询；发现信息位于当前用户应用数据目录，软件默认关闭出口。详细协议、上限和状态含义见 `docs/Codex只读接入.md`。
+
+## Codex 受控写入
+
+`WriteController` 管理临时人工白名单、上下限、可撤销 gate 与256条去重操作记录。GUI 请求写入仅提交 `ProbeCommand::GuardedAiWrite`，worker 使用 `ProbeSession::guarded_ai_write` 和纯逻辑 `guarded_io` 做写前比较、写入和读回；通过 `AiWriteFinished` 关联异步最终结果。
+
+本地请求的单调时钟截止时间传入 worker；过期或权限撤销时不再发起写入。App Drop 在 worker shutdown 前撤销许可，Debug Reset 和程序/配置切换也撤销。原有手动 WriteValue/寄存器/调试命令保持原通路。
+
+详情、MCP参数、结果状态与实机验收边界见 `docs/Codex参数写入.md`。
+
+## 通用 PID 会话
+
+`tools/pid_online.py` 在既有MCP读写接口上实现主机状态机和持久化基线，显式绑定六个变量，不直接访问探针。checkpoint/intent先落盘，再提交一项增益；后续轮询校验完整原生请求、授权代次和写入结果。rollback仅恢复本轮单项增益，拒绝外部改变或不确定结果。
+
+`WriteController.permission_epoch` 在授权改变与撤销时更新；PID提交携带预期epoch，由原生端校验。会话同时绑定软件session_id和变量身份；不把主机顺序读取称为MCU同步帧。文件锁与原子替换防会话并发，数据存放于当前用户应用数据目录。
+
+六项PID工具不运行后台控制任务。MCU周期边界原子更新、无扰切换及失联保护仍需专门固件接口，本轮未实现。完整说明见 `docs/PID在线调试方案.md`。
+
+## 默认数值访问（2.2.0）
+
+按最新需求删除人工白名单、范围授权、AI开关和写入设置窗口。main默认启动本机接口，WriteController默认开放所有类型/大小匹配的已加载数值变量；get_write_permissions返回类型界限而非机械安全界限。
+
+上下文变化调用invalidate：关闭旧gate、增加代次、建立默认可用的新gate；旧任务不复活，后续任务无需再授权。App Drop调用shutdown并停止接口，确保退出时不生成新可用gate。MCP工具名及PID会话接口保持兼容。
+
+完整当前行为及验证见 `docs/默认AI读写说明.md`；前述人工授权描述属于历史实现。
+
+## 工作区与调参联动（2026-11-04）
+
+`ui/workspace.rs` 保存两种布局的分隔比例、区域顺序与背景设置；新增顶层 JSON `workspace` 有默认值，旧配置无需迁移。背景 PNG 内置，只首次渲染时解码并缓存纹理。Dock 同时渲染三个插件，独立窗口与最大化仅影响布局，不改变 MCU 状态。
+
+变量表通过 `PluginAction::AddToChart` 提交变量 ID、短名、中文注释，应用转交图表插件；整个批次预校验后复用已有变量池，新增 Stream 绑定，Watch 的 Latest 绑定保留。重复添加仅恢复可见并定位，移除曲线仅释放 Stream。注释通过只读 annotations 同步，不改用户曲线名称。
+
+`ui/debug_tools.rs` 提供格式化、区间统计和写入记录。A/B 统计读取原始历史，打开时最多每 250 ms 计算一次；CSV 从导出瞬间的历史快照后台写文件，不插值、不修改采集缓存。手工/AI 写入日志由应用提交路径及 Worker 完成事件更新，明确区分成功与回读验证；AI 真实预读/回读原始位在可用时追加。记录仅覆盖变量表和 AI 变量写入，不覆盖寄存器、调试器局部变量或外部程序操作。
+
+## 外观自动记忆（2026-11-04）
+
+`AppearanceStore` 单独持久化背景显示强度和面板不透明度，Windows 路径为 `%LOCALAPPDATA%/MemRW3/appearance.json`。启动先读取并限制到合法范围；已有本机偏好优先于后来加载的调参 JSON，布局等项目字段不受影响。首次没有本机偏好时可从调参配置沿用外观。每次调整后 400 ms 防抖写入，静止界面会请求一次必要重绘；正常 Drop 补存。写入使用同目录临时文件、sync_all 与 rename 替换，失败保留旧文件并显示原因，不依赖新包或 eframe persistence 特性。
+
+## 界面偏好、布局与调试助手（2026-11-12）
+
+`ui/prefs.rs` 是进程内唯一的本机界面偏好存储（`%LOCALAPPDATA%/MemRW3/ui-prefs.json`）：布局、变量表隐藏列与换行、侧栏开关和宽度；修改后 400 ms 防抖并原子替换写入，退出补存，单元测试中不落盘。调参 JSON 仍可携带同样的设置，JSON 中存在的项优先，缺失的项沿用本机偏好。
+
+`WorkspaceSettings` 新增 `hidden` 与 `arrangement`（均有默认值）；`Dock` 只为可见且未弹出的面板分配区域，面板标题拖动只交换 `order` 中的位置，不改变插件状态或 MCU 状态。
+
+`ui/side_panel.rs` 由 App 直接持有，不是插件：只读取变量池、插件注释、`DebugSnapshot` 和 `RegisterData`，副作用只有 `AddToChart`、`OpenVariableTree` 和 `ReadRegisters` 三种既有 `PluginAction`。内存查看用带标记的请求 ID 复用寄存器读取通路，App 每帧清理过期代次的结果。`ui/expr.rs` 是表达式的纯逻辑解析与求值。

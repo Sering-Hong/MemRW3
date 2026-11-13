@@ -15,7 +15,7 @@ pub fn control_bar(ui: &mut Ui, app: &mut MemRW3App) {
         .corner_radius(3)
         .inner_margin(egui::Margin::symmetric(12, 4))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
                 connect_button(ui, app);
                 ui.separator();
@@ -42,6 +42,11 @@ pub fn control_bar(ui: &mut Ui, app: &mut MemRW3App) {
                 );
                 ui.separator();
                 theme_button(ui);
+                if app.ai_interface_ready() {
+                    ui.label(RichText::new("Codex 读写就绪").size(12.0));
+                } else {
+                    ui.colored_label(ui.visuals().warn_fg_color, "AI接口异常");
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     sampling_status(ui, app);
                 });

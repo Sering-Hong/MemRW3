@@ -257,11 +257,15 @@ fn configured_style(mut style: egui::Style, palette: Palette, dark_mode: bool) -
 }
 
 pub fn palette(ui: &Ui) -> Palette {
-    if ui.visuals().dark_mode {
+    let mut colors = if ui.visuals().dark_mode {
         dark_palette()
     } else {
         light_palette()
-    }
+    };
+    colors.panel_bg = crate::ui::workspace::surface(ui, colors.panel_bg);
+    colors.sidebar_bg = crate::ui::workspace::surface(ui, colors.sidebar_bg);
+    colors.surface_bg = crate::ui::workspace::surface(ui, colors.surface_bg);
+    colors
 }
 
 pub fn panel_stroke(ui: &Ui) -> Stroke {
@@ -292,9 +296,9 @@ fn dark_palette() -> Palette {
         border_strong: Color32::from_rgb(85, 91, 101),
         text: Color32::from_rgb(230, 232, 236),
         text_muted: Color32::from_rgb(152, 158, 168),
-        accent: Color32::from_rgb(82, 171, 164),
-        accent_hover: Color32::from_rgb(112, 196, 188),
-        accent_weak: Color32::from_rgb(38, 82, 80),
+        accent: Color32::from_rgb(94, 200, 187),
+        accent_hover: Color32::from_rgb(136, 220, 207),
+        accent_weak: Color32::from_rgb(34, 63, 62),
         success: Color32::from_rgb(94, 181, 110),
         warning: Color32::from_rgb(218, 163, 65),
         danger: Color32::from_rgb(219, 105, 105),
@@ -305,8 +309,8 @@ fn dark_palette() -> Palette {
 
 fn light_palette() -> Palette {
     Palette {
-        app_bg: Color32::from_rgb(242, 243, 245),
-        sidebar_bg: Color32::from_rgb(231, 233, 236),
+        app_bg: Color32::from_rgb(247, 250, 249),
+        sidebar_bg: Color32::from_rgb(230, 243, 239),
         panel_bg: Color32::from_rgb(248, 249, 250),
         surface_bg: Color32::from_rgb(255, 255, 255),
         elevated_bg: Color32::from_rgb(255, 255, 255),
@@ -315,9 +319,9 @@ fn light_palette() -> Palette {
         border_strong: Color32::from_rgb(178, 185, 194),
         text: Color32::from_rgb(32, 35, 40),
         text_muted: Color32::from_rgb(94, 101, 112),
-        accent: Color32::from_rgb(28, 133, 128),
-        accent_hover: Color32::from_rgb(19, 111, 107),
-        accent_weak: Color32::from_rgb(210, 235, 233),
+        accent: Color32::from_rgb(20, 119, 111),
+        accent_hover: Color32::from_rgb(13, 96, 91),
+        accent_weak: Color32::from_rgb(218, 240, 234),
         success: Color32::from_rgb(44, 132, 76),
         warning: Color32::from_rgb(174, 112, 25),
         danger: Color32::from_rgb(190, 67, 67),

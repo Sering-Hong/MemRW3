@@ -25,14 +25,14 @@ type CursorValue = (String, f64, f64, Color32);
 type CursorOverlay = (f32, f32, Vec<CursorValue>);
 type FftSeries<'a> = (&'a str, Color32, std::sync::Arc<FftResult>, f64);
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum YAxisMode {
     Auto,
     Fixed { min: f64, max: f64 },
     None,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum XAxisMode {
     Auto,
     Fixed(f64),
@@ -57,7 +57,7 @@ pub enum FftScrollMode {
 impl FftScrollMode {
     fn label(&self) -> &'static str {
         match self {
-            FftScrollMode::Both => "Both",
+            FftScrollMode::Both => "双轴",
             FftScrollMode::X => "X",
             FftScrollMode::Y => "Y",
         }
@@ -97,6 +97,19 @@ pub struct ChartPluginState {
     acq_frame_count: u64,
     acq_last_reset: Instant,
     was_running: bool,
+    legend_open: bool,
+    highlighted: Option<(usize, Instant)>,
+    highlight_scrolled: bool,
+    interval_enabled: bool,
+    cursor_a: f64,
+    cursor_b: f64,
+    stats_cache: Vec<(String, crate::ui::debug_tools::IntervalStats)>,
+    stats_updated: Instant,
+    export_pending: Option<std::sync::mpsc::Receiver<Result<usize, String>>>,
+    export_status: String,
+    x_edit: String,
+    y_min_edit: String,
+    y_max_edit: String,
 }
 
 impl Default for ChartPluginState {
@@ -134,6 +147,19 @@ impl Default for ChartPluginState {
             acq_frame_count: 0,
             acq_last_reset: Instant::now(),
             was_running: false,
+            legend_open: true,
+            highlighted: None,
+            highlight_scrolled: false,
+            interval_enabled: false,
+            cursor_a: 0.0,
+            cursor_b: 1.0,
+            stats_cache: Vec::new(),
+            stats_updated: Instant::now(),
+            export_pending: None,
+            export_status: String::new(),
+            x_edit: String::new(),
+            y_min_edit: String::new(),
+            y_max_edit: String::new(),
         }
     }
 }
@@ -178,6 +204,8 @@ struct SavedChartLegend {
     #[serde(default)]
     variable_size: Option<u32>,
     curve_name: String,
+    #[serde(default)]
+    comment: String,
     color: [u8; 4],
     visible: bool,
     buffer_size: usize,
@@ -192,6 +220,12 @@ struct SavedChartConfig {
     show_sparse_points: bool,
     #[serde(default = "default_point_marker_threshold")]
     sparse_point_threshold: usize,
+    #[serde(default)]
+    x_mode: Option<XAxisMode>,
+    #[serde(default)]
+    y_mode: Option<YAxisMode>,
+    #[serde(default = "default_retain_all")]
+    legend_open: bool,
 }
 
 #[derive(Deserialize)]
@@ -215,7 +249,7 @@ impl MemRWPlugin for ChartPluginState {
     }
 
     fn title(&self) -> &'static str {
-        "Chart 实时数据"
+        "图表"
     }
 
     fn viewport_size(&self) -> egui::Vec2 {
@@ -237,6 +271,50 @@ impl MemRWPlugin for ChartPluginState {
         Vec::new()
     }
 
+    fn add_chart_variables(
+        &mut self,
+        variables: &[(usize, String, String)],
+        pool: &mut VariablePool,
+    ) -> Result<bool, String> {
+        for (id, _, _) in variables {
+            let var = pool.get(*id).ok_or("变量已不存在")?;
+            if var.ext_type == ExtendType::Other {
+                return Err(format!("{} 不是可绘图的数值类型", var.name));
+            }
+        }
+        let mut changed = false;
+        for (id, name, comment) in variables {
+            let var = pool.get(*id).ok_or("变量已不存在")?;
+            if var.ext_type == ExtendType::Other {
+                return Err(format!("{} 不是可绘图的数值类型", var.name));
+            }
+            if let Some(legend) = self.legends.iter_mut().find(|l| l.variable_id == *id) {
+                legend.visible = true;
+                legend.comment = comment.clone();
+                self.highlighted = Some((*id, Instant::now()));
+                self.highlight_scrolled = false;
+                continue;
+            }
+            pool.bind(*id, true, VariableReadClass::Stream);
+            self.add_legend(*id, pool, name.clone(), super::legend::default_color(*id));
+            if let Some(legend) = self.legends.last_mut() {
+                legend.comment = comment.clone();
+            }
+            self.highlighted = Some((*id, Instant::now()));
+            self.highlight_scrolled = false;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    fn sync_annotations(&mut self, annotations: &[(usize, String, String)]) {
+        for (id, _, comment) in annotations {
+            if let Some(legend) = self.legends.iter_mut().find(|l| l.variable_id == *id) {
+                legend.comment = comment.clone();
+            }
+        }
+    }
+
     fn reset_data(&mut self) {
         if self.logging_active {
             self.log_stopped = true;
@@ -245,6 +323,8 @@ impl MemRWPlugin for ChartPluginState {
             legend.data_history.clear();
             legend.plot_bridge = None;
         }
+        self.stats_cache.clear();
+        self.stats_updated = Instant::now() - std::time::Duration::from_secs(1);
         self.auto_scroll = true;
         self.td_plot_bounds = None;
         self.fft_plot_bounds = None;
@@ -338,6 +418,36 @@ impl MemRWPlugin for ChartPluginState {
         self.show_line_dialog
     }
 
+    fn readonly_history(
+        &self,
+        variable_id: usize,
+        seconds: f64,
+        limit: usize,
+    ) -> Option<serde_json::Value> {
+        let legend = self
+            .legends
+            .iter()
+            .find(|line| line.variable_id == variable_id)?;
+        let end = legend.data_history.back().map(|point| point.x);
+        let cutoff = end.unwrap_or(0.0) - seconds;
+        let mut points: Vec<_> = legend
+            .data_history
+            .iter()
+            .rev()
+            .take_while(|point| point.x >= cutoff)
+            .take(limit.saturating_add(1))
+            .map(|point| serde_json::json!({"time_s":point.x,"value":point.y}))
+            .collect();
+        let truncated = points.len() > limit;
+        points.truncate(limit);
+        points.reverse();
+        Some(
+            serde_json::json!({"curve_name":legend.curve_name,"retained_points":legend.data_history.len(),
+            "end_time_s":end,"requested_seconds":seconds,"truncated":truncated,"points":points,
+            "display_compressed":false,"retention_limited":legend.buffer_size>0}),
+        )
+    }
+
     fn save_config(&self, pool: &VariablePool) -> serde_json::Value {
         let legends: Vec<SavedChartLegend> = self
             .legends
@@ -350,6 +460,7 @@ impl MemRWPlugin for ChartPluginState {
                     variable_type: var.map(|v| v.ext_type.clone()),
                     variable_size: var.map(|v| v.size),
                     curve_name: legend.curve_name.clone(),
+                    comment: legend.comment.clone(),
                     color: [
                         legend.color.r(),
                         legend.color.g(),
@@ -364,6 +475,9 @@ impl MemRWPlugin for ChartPluginState {
             .collect();
         serde_json::to_value(SavedChartConfig {
             legends,
+            x_mode: Some(self.x_mode.clone()),
+            y_mode: Some(self.y_mode.clone()),
+            legend_open: self.legend_open,
             show_sparse_points: self.show_sparse_points,
             sparse_point_threshold: self.sparse_point_threshold,
         })
@@ -380,13 +494,25 @@ impl MemRWPlugin for ChartPluginState {
         >(payload.clone())
         .map_err(|e| e.to_string())?
         {
-            SavedChartPayload::Current(config) => (
-                config.legends,
-                config.show_sparse_points,
-                config
-                    .sparse_point_threshold
-                    .clamp(MIN_POINT_MARKER_THRESHOLD, MAX_POINT_MARKER_THRESHOLD),
-            ),
+            SavedChartPayload::Current(config) => {
+                self.x_mode = config.x_mode.unwrap_or(XAxisMode::Auto);
+                self.y_mode = config.y_mode.unwrap_or(YAxisMode::Auto);
+                self.legend_open = config.legend_open;
+                if let XAxisMode::Fixed(value) = self.x_mode {
+                    self.x_edit = value.to_string();
+                }
+                if let YAxisMode::Fixed { min, max } = self.y_mode {
+                    self.y_min_edit = min.to_string();
+                    self.y_max_edit = max.to_string();
+                }
+                (
+                    config.legends,
+                    config.show_sparse_points,
+                    config
+                        .sparse_point_threshold
+                        .clamp(MIN_POINT_MARKER_THRESHOLD, MAX_POINT_MARKER_THRESHOLD),
+                )
+            }
             SavedChartPayload::Legacy(legends) => (legends, false, DEFAULT_POINT_MARKER_THRESHOLD),
         };
 
@@ -410,7 +536,9 @@ impl MemRWPlugin for ChartPluginState {
                 .map(|v| v.id)
                 .ok_or_else(|| format!("图表变量 \"{}\" 匹配失败", saved.variable_name))?;
 
-            let mut legend = ChartLegend::new(var_id, saved.curve_name);
+            let mut legend = ChartLegend::new(var_id, saved.variable_name.clone());
+            legend.curve_name = saved.curve_name;
+            legend.comment = saved.comment;
             legend.color = Color32::from_rgba_premultiplied(
                 saved.color[0],
                 saved.color[1],
@@ -556,13 +684,14 @@ pub fn chart_panel(
     running: bool,
 ) -> bool {
     let mut open_tree = false;
+    history_tools(ui, state);
 
     ui.vertical(|ui| {
         let dialog_is_open = state.show_line_dialog;
 
         ui.add_enabled_ui(!dialog_is_open, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("📈 实时数据图表").size(16.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.heading(RichText::new("实时数据图表").size(16.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(!state.logging_active, |ui| {
                         if ui
@@ -594,6 +723,7 @@ pub fn chart_panel(
                     state.acq_frame_count = 0;
                     state.reset_timer = true;
                 }
+                ui.toggle_value(&mut state.legend_open, "曲线列表");
                 if ui.button("回到最新").clicked() {
                     state.auto_scroll = true;
                     state.td_plot_bounds = None;
@@ -635,32 +765,36 @@ pub fn chart_panel(
                     .width(80.0)
                     .show_ui(ui, |ui| {
                         if ui
-                            .selectable_label(state.x_mode == XAxisMode::Auto, "自动")
+                            .selectable_label(state.x_mode == XAxisMode::Auto, "完整历史")
                             .clicked()
                         {
                             state.x_mode = XAxisMode::Auto;
+                            state.auto_scroll = true;
+                            state.td_plot_bounds = None;
                         }
                         if ui
-                            .selectable_label(matches!(state.x_mode, XAxisMode::Fixed(_)), "固定")
+                            .selectable_label(
+                                matches!(state.x_mode, XAxisMode::Fixed(_)),
+                                "最近时间窗",
+                            )
                             .clicked()
                         {
-                            let xr = visible_history_bounds(&state.legends)
-                                .map(|(x_min, x_max, _, _)| (x_max - x_min).max(6.0))
-                                .unwrap_or(6.0);
-                            state.x_mode = XAxisMode::Fixed(xr.max(6.0));
+                            state.x_mode = XAxisMode::Fixed(10.0);
+                            state.x_edit = "10.000".to_owned();
+                            state.auto_scroll = true;
                         }
                     });
                 if let XAxisMode::Fixed(w) = &mut state.x_mode {
-                    let mut w_str = format!("{:.3}", *w);
-                    if ui
-                        .add_sized(
-                            [65.0, 20.0],
-                            egui::TextEdit::singleline(&mut w_str).hint_text("s"),
-                        )
-                        .changed()
-                    {
-                        if let Ok(v) = w_str.parse::<f64>() {
-                            *w = v.max(0.001);
+                    let response = ui.add_sized(
+                        [65.0, 20.0],
+                        egui::TextEdit::singleline(&mut state.x_edit).hint_text("s"),
+                    );
+                    if response.lost_focus() {
+                        if let Ok(v) = state.x_edit.parse::<f64>() {
+                            if v.is_finite() && v > 0.0 {
+                                *w = v;
+                                state.auto_scroll = true;
+                            }
                         }
                     }
                     ui.label("s");
@@ -674,6 +808,8 @@ pub fn chart_panel(
                             .clicked()
                         {
                             state.y_mode = YAxisMode::Auto;
+                            state.auto_scroll = true;
+                            state.td_plot_bounds = None;
                         }
                         if ui
                             .selectable_label(
@@ -686,10 +822,12 @@ pub fn chart_panel(
                                 .map(|(_, _, y_min, y_max)| (y_min, y_max))
                                 .unwrap_or((0.0, 0.0));
                             let range = (hi - lo).max(10.0);
-                            state.y_mode = YAxisMode::Fixed {
-                                min: lo - range * 0.1,
-                                max: hi + range * 0.1,
-                            };
+                            let min = lo - range * 0.1;
+                            let max = hi + range * 0.1;
+                            state.y_mode = YAxisMode::Fixed { min, max };
+                            state.y_min_edit = format!("{min:.2}");
+                            state.y_max_edit = format!("{max:.2}");
+                            state.auto_scroll = true;
                         }
                         if ui
                             .selectable_label(state.y_mode == YAxisMode::None, "无")
@@ -699,24 +837,26 @@ pub fn chart_panel(
                         }
                     });
                 if let YAxisMode::Fixed { min, max } = &mut state.y_mode {
-                    ui.label("min:");
-                    let mut min_str = format!("{:.2}", *min);
-                    if ui
-                        .add_sized([55.0, 20.0], egui::TextEdit::singleline(&mut min_str))
-                        .changed()
-                    {
-                        if let Ok(v) = min_str.parse::<f64>() {
-                            *min = v;
-                        }
-                    }
-                    ui.label("max:");
-                    let mut max_str = format!("{:.2}", *max);
-                    if ui
-                        .add_sized([55.0, 20.0], egui::TextEdit::singleline(&mut max_str))
-                        .changed()
-                    {
-                        if let Ok(v) = max_str.parse::<f64>() {
-                            *max = v;
+                    ui.label("最小值：");
+                    let min_response = ui.add_sized(
+                        [65.0, 20.0],
+                        egui::TextEdit::singleline(&mut state.y_min_edit),
+                    );
+                    ui.label("最大值：");
+                    let max_response = ui.add_sized(
+                        [65.0, 20.0],
+                        egui::TextEdit::singleline(&mut state.y_max_edit),
+                    );
+                    if min_response.lost_focus() || max_response.lost_focus() {
+                        if let (Ok(lo), Ok(hi)) = (
+                            state.y_min_edit.parse::<f64>(),
+                            state.y_max_edit.parse::<f64>(),
+                        ) {
+                            if lo.is_finite() && hi.is_finite() && lo < hi {
+                                *min = lo;
+                                *max = hi;
+                                state.auto_scroll = true;
+                            }
                         }
                     }
                 }
@@ -725,7 +865,7 @@ pub fn chart_panel(
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Log:");
+                    ui.label("实时记录：");
                     ui.add_enabled_ui(!state.logging_active, |ui| {
                         if ui.button("选择文件").clicked() {
                             if let Some(p) = crate::ui::file_dialog()
@@ -748,7 +888,7 @@ pub fn chart_panel(
                                 .to_string(),
                         );
                     } else {
-                        ui.label("不 log");
+                        ui.label("未选择记录文件");
                     }
                 });
             });
@@ -769,7 +909,7 @@ pub fn chart_panel(
 
             if state.legends.is_empty() {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
+                    ui.add_space(10.0);
                     ui.label(
                         RichText::new("暂无监控变量")
                             .size(13.0)
@@ -929,7 +1069,259 @@ fn write_log_frame(
     }
 }
 
+type HistoryExport = Vec<(String, String, Vec<(f64, f64)>)>;
+fn write_history_csv(writer: &mut impl Write, histories: &HistoryExport) -> std::io::Result<usize> {
+    use crate::ui::debug_tools::csv_field;
+    writeln!(writer, "\u{feff}变量路径,中文注释,采样时间秒,数值")?;
+    let mut count = 0;
+    for (path, comment, points) in histories {
+        let prefix = format!("{},{}", csv_field(path), csv_field(comment));
+        for (time, value) in points {
+            writeln!(writer, "{prefix},{time},{value}")?;
+            count += 1;
+        }
+    }
+    writer.flush()?;
+    Ok(count)
+}
+
+fn history_tools(ui: &mut Ui, state: &mut ChartPluginState) {
+    if let Some(receiver) = &state.export_pending {
+        match receiver.try_recv() {
+            Ok(result) => {
+                state.export_status = result
+                    .map(|count| format!("已导出 {count} 条采样"))
+                    .unwrap_or_else(|e| format!("导出失败：{e}"));
+                state.export_pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                state.export_status = "导出任务异常结束".into();
+                state.export_pending = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .checkbox(&mut state.interval_enabled, "A/B 区间统计")
+            .changed()
+        {
+            state.stats_updated = Instant::now() - std::time::Duration::from_secs(1);
+        }
+        if state.interval_enabled {
+            let mut changed = false;
+            ui.label("A(s)");
+            changed |= ui
+                .add(egui::DragValue::new(&mut state.cursor_a).speed(0.01))
+                .changed();
+            ui.label("B(s)");
+            changed |= ui
+                .add(egui::DragValue::new(&mut state.cursor_b).speed(0.01))
+                .changed();
+            if changed {
+                state.stats_updated = Instant::now() - std::time::Duration::from_secs(1);
+            }
+            ui.label(format!(
+                "时间差 {:.6} s",
+                (state.cursor_b - state.cursor_a).abs()
+            ));
+            ui.label("Shift+点击设 A；Ctrl+点击设 B");
+        }
+        let all = ui
+            .add_enabled(
+                state.export_pending.is_none(),
+                egui::Button::new("导出全部历史 CSV"),
+            )
+            .clicked();
+        let interval = ui
+            .add_enabled(
+                state.export_pending.is_none() && state.interval_enabled,
+                egui::Button::new("导出 A/B 区间 CSV"),
+            )
+            .clicked();
+        if all || interval {
+            if let Some(path) = crate::ui::file_dialog()
+                .add_filter("CSV", &["csv"])
+                .set_file_name("变量历史.csv")
+                .save_file()
+            {
+                let lo = state.cursor_a.min(state.cursor_b);
+                let hi = state.cursor_a.max(state.cursor_b);
+                let histories = state
+                    .legends
+                    .iter()
+                    .map(|l| {
+                        (
+                            l.variable_path.clone(),
+                            l.comment.clone(),
+                            l.data_history
+                                .iter()
+                                .filter(|p| !interval || (p.x >= lo && p.x <= hi))
+                                .map(|p| (p.x, p.y))
+                                .collect(),
+                        )
+                    })
+                    .collect::<HistoryExport>();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let ctx = ui.ctx().clone();
+                state.export_pending = Some(receiver);
+                state.export_status = "正在后台导出…".into();
+                std::thread::spawn(move || {
+                    let result = std::fs::File::create(path)
+                        .and_then(|file| write_history_csv(&mut BufWriter::new(file), &histories))
+                        .map_err(|e| e.to_string());
+                    let _ = sender.send(result);
+                    ctx.request_repaint();
+                });
+            }
+        }
+        if !state.export_status.is_empty() {
+            ui.label(&state.export_status);
+        }
+    });
+    if state.interval_enabled {
+        if state.stats_updated.elapsed().as_millis() >= 250 {
+            state.stats_cache = state
+                .legends
+                .iter()
+                .map(|l| {
+                    (
+                        l.curve_name.clone(),
+                        crate::ui::debug_tools::IntervalStats::calculate(
+                            l.data_history.iter().map(|p| (p.x, p.y)),
+                            state.cursor_a,
+                            state.cursor_b,
+                        ),
+                    )
+                })
+                .collect();
+            state.stats_updated = Instant::now();
+        }
+        egui::ScrollArea::both()
+            .id_salt("interval_stats")
+            .max_height(85.0)
+            .show(ui, |ui| {
+                egui::Grid::new("interval_stats_grid")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for title in ["曲线", "有效样本", "最小值", "最大值", "均值", "峰峰值"]
+                        {
+                            ui.strong(title);
+                        }
+                        ui.end_row();
+                        for (name, stats) in &state.stats_cache {
+                            ui.label(name);
+                            ui.label(stats.count.to_string());
+                            for value in [stats.min, stats.max, stats.mean, stats.max - stats.min] {
+                                ui.label(if stats.count == 0 {
+                                    "—".into()
+                                } else {
+                                    format!("{value:.6}")
+                                });
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+}
+
 fn render_chart(ui: &mut Ui, state: &mut ChartPluginState) {
+    if state.legend_open {
+        egui::Panel::right("chart_series_list")
+            .frame(egui::Frame::NONE)
+            .resizable(true)
+            .default_size(260.0)
+            .size_range(150.0..=900.0)
+            .show_inside(ui, |ui| {
+                ui.strong("曲线与当前值");
+                ui.label(
+                    RichText::new("名称自动换行；拖动左边缘可加宽")
+                        .size(10.5)
+                        .color(theme::muted_text(ui)),
+                );
+                ui.separator();
+                let mut edit_index = None;
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (i, legend) in state.legends.iter_mut().enumerate() {
+                        if state.highlighted.is_some_and(|(id, when)| {
+                            id == legend.variable_id && when.elapsed().as_secs_f32() < 2.0
+                        }) {
+                            ui.colored_label(theme::palette(ui).accent_hover, "已定位曲线");
+                            if !state.highlight_scrolled {
+                                ui.scroll_to_cursor(Some(egui::Align::Center));
+                                state.highlight_scrolled = true;
+                            }
+                        }
+                        // 名称完整换行显示，注释另起一行。
+                        let response = ui
+                            .horizontal_top(|ui| {
+                                ui.checkbox(&mut legend.visible, "");
+                                ui.vertical(|ui| {
+                                    let response =
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&legend.curve_name)
+                                                    .color(legend.color),
+                                            )
+                                            .wrap()
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(
+                                            format!("{}\n{}", legend.variable_path, legend.comment),
+                                        );
+                                    if response.clicked() {
+                                        legend.visible = !legend.visible;
+                                    }
+                                    if !legend.comment.is_empty()
+                                        && legend.comment != legend.curve_name
+                                    {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&legend.comment)
+                                                    .size(11.0)
+                                                    .color(theme::muted_text(ui)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                    response
+                                })
+                                .inner
+                            })
+                            .inner;
+                        response.context_menu(|ui| {
+                            if ui.button("曲线属性").clicked() {
+                                edit_index = Some(i);
+                                ui.close();
+                            }
+                        });
+                        let value = legend
+                            .data_history
+                            .back()
+                            .map(|p| format!("{:.6}", p.y))
+                            .unwrap_or_else(|| "--".to_owned());
+                        ui.add(egui::Label::new(RichText::new(&value).monospace()).truncate())
+                            .on_hover_text(value);
+                        ui.separator();
+                    }
+                });
+                if let Some(i) = edit_index {
+                    let legend = &state.legends[i];
+                    state.editing_legend = Some(i);
+                    state.show_line_dialog = true;
+                    state.edit_curve_name = legend.curve_name.clone();
+                    state.edit_color = legend.color;
+                    state.edit_visible = legend.visible;
+                    state.edit_buffer_size = legend.buffer_size;
+                }
+            });
+    }
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
+        .show_inside(ui, |ui| render_chart_canvas(ui, state));
+}
+fn render_chart_canvas(ui: &mut Ui, state: &mut ChartPluginState) {
     let available_h = ui.available_height();
     let plot_height = (available_h - 24.0).max(100.0);
 
@@ -1000,7 +1392,9 @@ fn render_chart(ui: &mut Ui, state: &mut ChartPluginState) {
     let mut cursor_labels: Option<CursorOverlay> = None;
     let cursor_line = theme::palette(ui).border_strong.linear_multiply(0.8);
 
+    let marker_colors = theme::palette(ui);
     let plot_response = Plot::new("chart_plot")
+        .show_background(false)
         .height(plot_height)
         .show_axes([true, show_y_axis])
         .show_grid([true, true])
@@ -1025,8 +1419,7 @@ fn render_chart(ui: &mut Ui, state: &mut ChartPluginState) {
                 let (x_min, x_max) = bounds
                     .map(|b| (b.0, b.1))
                     .unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
-                let points = history_plot_points(
-                    &legend.data_history,
+                let points = legend.cached_plot_points(
                     x_min,
                     x_max,
                     (plot_rect.width().max(100.0) as usize) * 4,
@@ -1035,11 +1428,35 @@ fn render_chart(ui: &mut Ui, state: &mut ChartPluginState) {
                     Line::new(legend.curve_name.clone(), PlotPoints::Owned(points))
                         .id(egui::Id::new(("chart_line", legend_index, 0)))
                         .color(legend.color)
-                        .width(1.5),
+                        .width(
+                            if state.highlighted.is_some_and(|(id, when)| {
+                                id == legend.variable_id && when.elapsed().as_secs_f32() < 2.0
+                            }) {
+                                3.0_f32
+                            } else {
+                                1.5_f32
+                            },
+                        ),
                 );
             }
 
+            if state.interval_enabled {
+                plot_ui.vline(
+                    egui_plot::VLine::new("游标 A", state.cursor_a).color(marker_colors.accent),
+                );
+                plot_ui.vline(
+                    egui_plot::VLine::new("游标 B", state.cursor_b).color(marker_colors.warning),
+                );
+            }
             if let Some(cursor) = plot_ui.pointer_coordinate() {
+                if state.interval_enabled && plot_ui.response().clicked() {
+                    if plot_ui.ctx().input(|i| i.modifiers.shift) {
+                        state.cursor_a = cursor.x;
+                    }
+                    if plot_ui.ctx().input(|i| i.modifiers.ctrl) {
+                        state.cursor_b = cursor.x;
+                    }
+                }
                 let t = cursor.x;
                 let screen = plot_ui.screen_from_plot(cursor);
                 let mut data: Vec<(String, f64, f64, Color32)> = Vec::new();
@@ -1065,6 +1482,7 @@ fn render_chart(ui: &mut Ui, state: &mut ChartPluginState) {
 
             if plot_ui.response().drag_started() {
                 state.auto_scroll = false;
+                state.td_plot_bounds = None;
             }
             if plot_ui.response().double_clicked() {
                 state.auto_scroll = true;
@@ -1076,8 +1494,11 @@ fn render_chart(ui: &mut Ui, state: &mut ChartPluginState) {
                     plot_ui
                         .set_plot_bounds(PlotBounds::from_min_max([x_min, y_min], [x_max, y_max]));
                 }
-            } else if let Some((x_min, x_max, y_min, y_max)) = state.td_plot_bounds {
-                plot_ui.set_plot_bounds(PlotBounds::from_min_max([x_min, y_min], [x_max, y_max]));
+            } else if !plot_ui.response().dragged() && !plot_ui.response().drag_started() {
+                if let Some((x_min, x_max, y_min, y_max)) = state.td_plot_bounds {
+                    plot_ui
+                        .set_plot_bounds(PlotBounds::from_min_max([x_min, y_min], [x_max, y_max]));
+                }
             }
 
             if state.show_sparse_points {
@@ -1094,7 +1515,7 @@ fn render_chart(ui: &mut Ui, state: &mut ChartPluginState) {
                     {
                         plot_ui.points(
                             Points::new(
-                                format!("{} visible points", legend.curve_name),
+                                format!("{} 可见点", legend.curve_name),
                                 PlotPoints::Owned(points),
                             )
                             .id(egui::Id::new(("chart_visible_points", legend_index)))
@@ -1146,7 +1567,7 @@ fn render_chart(ui: &mut Ui, state: &mut ChartPluginState) {
         }
     }
 
-    legend_overlay(ui, state, plot_frame);
+    // Series controls live outside the plotting area.
 }
 
 fn render_fft_chart(ui: &mut Ui, state: &mut ChartPluginState) {
@@ -1278,6 +1699,7 @@ fn render_fft_chart(ui: &mut Ui, state: &mut ChartPluginState) {
     let cursor_line = theme::palette(ui).border_strong.linear_multiply(0.8);
 
     let plot_response = Plot::new("fft_plot")
+        .show_background(false)
         .height(plot_height)
         .show_axes([true, true])
         .show_grid([true, true])
@@ -1466,7 +1888,7 @@ fn compute_scroll_zoom(
 
 /// Reduce only the drawn copy, keeping first/last and each bucket's extrema.
 /// The acquisition history, cursor lookup, CSV and FFT retain the original samples.
-fn history_plot_points(
+pub(super) fn history_plot_points(
     data: &std::collections::VecDeque<PlotPoint>,
     x_min: f64,
     x_max: f64,
@@ -1507,29 +1929,19 @@ fn history_plot_points(
 }
 
 fn visible_history_bounds(legends: &[ChartLegend]) -> Option<(f64, f64, f64, f64)> {
-    let mut x_min = f64::INFINITY;
-    let mut x_max = f64::NEG_INFINITY;
-    let mut y_min = f64::INFINITY;
-    let mut y_max = f64::NEG_INFINITY;
-    let mut found = false;
-
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
     for legend in legends
         .iter()
-        .filter(|legend| legend.visible && legend.data_history.len() >= 2)
+        .filter(|l| l.visible && l.data_history.len() >= 2)
     {
-        if let (Some(first), Some(last)) = (legend.data_history.front(), legend.data_history.back())
-        {
-            x_min = x_min.min(first.x);
-            x_max = x_max.max(last.x);
+        if let Some((a, b, c, d)) = legend.cached_bounds() {
+            bounds = Some(match bounds {
+                Some((x0, x1, y0, y1)) => (x0.min(a), x1.max(b), y0.min(c), y1.max(d)),
+                None => (a, b, c, d),
+            });
         }
-        for point in &legend.data_history {
-            y_min = y_min.min(point.y);
-            y_max = y_max.max(point.y);
-        }
-        found = true;
     }
-
-    found.then_some((x_min, x_max, y_min, y_max))
+    bounds
 }
 
 /// Return points that are actually inside the current plot viewport, but only
@@ -1614,65 +2026,7 @@ fn nearest_mag(points: &[egui_plot::PlotPoint], target: f64) -> f64 {
     }
 }
 
-fn legend_overlay(ui: &mut Ui, state: &mut ChartPluginState, plot_rect: egui::Rect) {
-    let colors = theme::palette(ui);
-    let mut toggle = None;
-    let mut edit = None;
-    let mut y = plot_rect.top() + 9.0;
-    for (i, legend) in state.legends.iter().enumerate() {
-        let op = if legend.visible { 1.0 } else { 0.35 };
-        let tc = if legend.visible {
-            colors.text
-        } else {
-            colors.text_muted
-        };
-        let text = legend.curve_name.clone();
-        let g = ui
-            .painter()
-            .layout_no_wrap(text, egui::FontId::proportional(11.0), tc);
-        let w = g.rect.width() + 24.0;
-        let h = g.rect.height() + 6.0;
-        let r = right_aligned_legend_rect(plot_rect, y, egui::vec2(w, h));
-        let resp = ui.interact(r, egui::Id::new(("chart_legend", i)), egui::Sense::click());
-        let bg = if resp.hovered() {
-            colors.elevated_bg
-        } else {
-            colors.tooltip_bg
-        };
-        ui.painter().rect_filled(r, egui::CornerRadius::same(3), bg);
-        let bar = egui::Rect::from_min_size(
-            egui::pos2(r.left() + 4.0, r.top() + 3.0),
-            egui::vec2(8.0, h - 6.0),
-        );
-        ui.painter().rect_filled(
-            bar,
-            egui::CornerRadius::same(2),
-            legend.color.linear_multiply(op),
-        );
-        ui.painter()
-            .galley(egui::pos2(r.left() + 14.0, r.top() + 3.0), g, tc);
-        if resp.clicked() {
-            toggle = Some(i);
-        }
-        if resp.secondary_clicked() {
-            edit = Some(i);
-        }
-        y += h + 3.0;
-    }
-    if let Some(i) = toggle {
-        state.legends[i].visible = !state.legends[i].visible;
-    }
-    if let Some(i) = edit {
-        state.editing_legend = Some(i);
-        state.show_line_dialog = true;
-        let legend = &state.legends[i];
-        state.edit_curve_name = legend.curve_name.clone();
-        state.edit_color = legend.color;
-        state.edit_buffer_size = legend.buffer_size;
-        state.edit_visible = legend.visible;
-    }
-}
-
+#[cfg(test)]
 fn right_aligned_legend_rect(
     plot_rect: egui::Rect,
     y: f32,
@@ -1812,8 +2166,8 @@ fn y_mode_label(mode: &YAxisMode) -> String {
 
 fn x_mode_label(mode: &XAxisMode) -> String {
     match mode {
-        XAxisMode::Auto => "自动".to_string(),
-        XAxisMode::Fixed(w) => format!("{:.3}s", w),
+        XAxisMode::Auto => "完整历史".to_string(),
+        XAxisMode::Fixed(w) => format!("最近 {w:.3}s"),
     }
 }
 
@@ -2071,5 +2425,175 @@ mod tests {
         let oversized = right_aligned_legend_rect(plot, 80.0, egui::vec2(800.0, 20.0));
         assert_eq!(oversized.left(), plot.left() + 5.0);
         assert_eq!(oversized.right(), plot.right() - 5.0);
+    }
+}
+
+#[cfg(test)]
+mod enhanced_chart_interaction_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_chart_frames_keep_manual_view_and_raw_history() {
+        let mut state = ChartPluginState::default();
+        for index in 0..3 {
+            let mut legend = ChartLegend::new(index, format!("long_curve_name_{index}"));
+            for point in 0..120_000 {
+                legend.push_prepared(
+                    point as f64 * 0.001,
+                    if point == 60_001 {
+                        999.0
+                    } else {
+                        (point as f64 * 0.01).sin()
+                    },
+                );
+            }
+            state.legends.push(legend);
+        }
+        let ctx = egui::Context::default();
+        let started = std::time::Instant::now();
+        for frame in 0..30 {
+            if frame == 5 {
+                state.auto_scroll = false;
+                state.td_plot_bounds = Some((20.0, 25.0, -2.0, 2.0));
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 650.0),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render_chart(ui, &mut state);
+                    });
+                },
+            );
+            if frame >= 5 {
+                assert!(!state.auto_scroll);
+                let bounds = state.td_plot_bounds.unwrap();
+                assert!((bounds.0 - 20.0).abs() < 0.01 && (bounds.1 - 25.0).abs() < 0.01);
+            }
+        }
+        assert!(
+            state
+                .legends
+                .iter()
+                .all(|l| l.data_history.len() == 120_000)
+        );
+        eprintln!(
+            "headless chart: 30 frames, 3 x 120000 points, {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod readonly_history_tests {
+    use super::*;
+    #[test]
+    fn history_is_uncompressed_bounded_and_keeps_raw_samples() {
+        let mut chart = ChartPluginState::default();
+        let mut legend = ChartLegend::new(3, "speed".into());
+        for i in 0..100 {
+            legend.push_prepared(i as f64, i as f64);
+        }
+        chart.legends.push(legend);
+        let history = chart.readonly_history(3, 10.0, 5).unwrap();
+        assert_eq!(history["points"].as_array().unwrap().len(), 5);
+        assert_eq!(history["points"][0]["time_s"], 95.0);
+        assert_eq!(history["truncated"], true);
+        assert_eq!(history["display_compressed"], false);
+        assert_eq!(chart.legends[0].data_history.len(), 100);
+        assert!(chart.readonly_history(4, 10.0, 5).is_none());
+    }
+}
+
+#[cfg(test)]
+mod workspace_feature_tests {
+    use super::*;
+    use crate::dwarf::types::ExtendConfig;
+
+    fn pool_and_id() -> (VariablePool, usize) {
+        let mut pool = VariablePool::default();
+        let id = pool.add(&ExtendConfig {
+            name: "motor.kp".into(),
+            address: 0x20000000,
+            ext_type: ExtendType::Float,
+            size: 4,
+            array_index: None,
+            array_count: None,
+        });
+        pool.bind(id, true, VariableReadClass::Latest);
+        (pool, id)
+    }
+
+    #[test]
+    fn watch_to_chart_deduplicates_and_preserves_latest_binding() {
+        let (mut pool, id) = pool_and_id();
+        let mut chart = ChartPluginState::default();
+        let variables = vec![(id, "kp".into(), "比例增益".into())];
+        assert!(chart.add_chart_variables(&variables, &mut pool).unwrap());
+        assert!(!chart.add_chart_variables(&variables, &mut pool).unwrap());
+        assert_eq!(chart.legends.len(), 1);
+        assert_eq!(pool.get(id).unwrap().stream_readers, 1);
+        assert_eq!(pool.get(id).unwrap().latest_readers, 1);
+        let saved = chart.save_config(&pool);
+        let mut restored_pool = VariablePool::default();
+        restored_pool.add(&ExtendConfig {
+            name: "motor.kp".into(),
+            address: 0x20000000,
+            ext_type: ExtendType::Float,
+            size: 4,
+            array_index: None,
+            array_count: None,
+        });
+        let mut restored = ChartPluginState::default();
+        restored.load_config(&saved, &mut restored_pool).unwrap();
+        assert_eq!(restored.legends[0].variable_path, "motor.kp");
+        assert_eq!(restored.legends[0].comment, "比例增益");
+        chart.remove_legend(0);
+        pool.unbind(id, true, VariableReadClass::Stream);
+        assert_eq!(pool.get(id).unwrap().latest_readers, 1);
+        assert_eq!(pool.get(id).unwrap().stream_readers, 0);
+    }
+
+    #[test]
+    fn invalid_batch_does_not_partially_bind() {
+        let (mut pool, id) = pool_and_id();
+        let mut chart = ChartPluginState::default();
+        assert!(
+            chart
+                .add_chart_variables(
+                    &[
+                        (id, "kp".into(), String::new()),
+                        (999, "invalid".into(), String::new())
+                    ],
+                    &mut pool
+                )
+                .is_err()
+        );
+        assert!(chart.legends.is_empty());
+        assert_eq!(pool.get(id).unwrap().stream_readers, 0);
+    }
+
+    #[test]
+    fn history_csv_keeps_distinct_sampling_times_and_escaped_comments() {
+        let histories = vec![
+            (
+                "motor.kp".into(),
+                "中文,\"说明\"".into(),
+                vec![(0.25, 1.0), (0.75, 2.0)],
+            ),
+            ("motor.speed".into(), String::new(), vec![(0.5, 3.0)]),
+        ];
+        let mut output = Vec::new();
+        assert_eq!(write_history_csv(&mut output, &histories).unwrap(), 3);
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("\"motor.kp\",\"中文,\"\"说明\"\"\",0.25,1"));
+        assert!(text.contains("\"motor.speed\",\"\",0.5,3"));
+        assert_eq!(text.lines().count(), 4);
     }
 }

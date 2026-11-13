@@ -147,7 +147,7 @@ impl MemRWPlugin for DebugPluginState {
     }
 
     fn title(&self) -> &'static str {
-        "Debug 调试器"
+        "调试"
     }
 
     fn viewport_size(&self) -> egui::Vec2 {
@@ -697,7 +697,7 @@ fn render_toolbar(ui: &mut Ui, state: &mut DebugPluginState) {
 fn step_method_label(method: Option<StepExecutionMethod>) -> &'static str {
     match method {
         Some(StepExecutionMethod::HardwareBreakpoint) => "步进: 硬件断点加速",
-        Some(StepExecutionMethod::SingleStep) => "步进: SingleStep",
+        Some(StepExecutionMethod::SingleStep) => "步进：单步执行",
         None => "步进: —",
     }
 }
@@ -3508,7 +3508,7 @@ mod tests {
         assert_eq!(step_method_label(None), "步进: —");
         assert_eq!(
             step_method_label(Some(crate::model::StepExecutionMethod::SingleStep)),
-            "步进: SingleStep"
+            "步进：单步执行"
         );
         assert_eq!(
             step_method_label(Some(crate::model::StepExecutionMethod::HardwareBreakpoint)),

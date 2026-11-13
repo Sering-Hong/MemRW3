@@ -60,6 +60,9 @@ pub enum ProbeCommand {
         value: u64,
         kind: WriteKind,
     },
+    GuardedAiWrite {
+        spec: crate::ai_write::WriteSpec,
+    },
     ReadRegisters {
         request_id: u64,
         requests: Vec<RegisterReadRequest>,
@@ -97,6 +100,10 @@ pub enum ProbeEvent {
         request_id: u64,
         kind: WriteKind,
         result: Result<(), String>,
+    },
+    AiWriteFinished {
+        request_id: u64,
+        outcome: crate::ai_write::WriteOutcome,
     },
     RegistersRead {
         request_id: u64,
@@ -515,6 +522,13 @@ impl ProbeWorker {
                     request_id,
                     kind,
                     result,
+                });
+            }
+            ProbeCommand::GuardedAiWrite { spec } => {
+                let outcome = self.probe.guarded_ai_write(&spec);
+                self.emit(ProbeEvent::AiWriteFinished {
+                    request_id: spec.request_id,
+                    outcome,
                 });
             }
             ProbeCommand::ReadRegisters {

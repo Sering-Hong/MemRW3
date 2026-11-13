@@ -53,6 +53,9 @@ pub enum ToastLevel {
 
 #[derive(Debug)]
 pub enum PluginAction {
+    AddToChart {
+        variables: Vec<(usize, String, String)>,
+    },
     OpenVariableTree {
         plugin_id: String,
         viewport_id: egui::ViewportId,
@@ -135,6 +138,14 @@ pub trait MemRWPlugin {
 
     fn render(&mut self, ui: &mut Ui, ctx: PluginRenderContext<'_>) -> Vec<PluginAction>;
 
+    fn add_chart_variables(
+        &mut self,
+        _variables: &[(usize, String, String)],
+        _pool: &mut VariablePool,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     fn add_variable_ui(
         &mut self,
         ui: &mut Ui,
@@ -146,6 +157,16 @@ pub trait MemRWPlugin {
 
     fn is_dialog_open(&self) -> bool {
         false
+    }
+
+    fn sync_annotations(&mut self, _annotations: &[(usize, String, String)]) {}
+
+    fn readonly_annotations(&self) -> Vec<(usize, String, String)> {
+        Vec::new()
+    }
+
+    fn readonly_history(&self, _variable_id: usize, _seconds: f64, _limit: usize) -> Option<Value> {
+        None
     }
 
     fn save_config(&self, _pool: &VariablePool) -> Value {

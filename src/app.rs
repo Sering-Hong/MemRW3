@@ -21,6 +21,10 @@ use std::{
 };
 pub struct MemRW3App {
     dock: DockLayoutState,
+    background: ui::workspace::Background,
+    appearance: ui::workspace::AppearanceStore,
+    journal: ui::debug_tools::WriteJournal,
+    side_panel: ui::side_panel::SidePanelState,
     pub session: AppSession,
     variable_tree: VariableTreePanel,
     plugins: Vec<Box<dyn MemRWPlugin>>,
@@ -37,6 +41,9 @@ pub struct MemRW3App {
     rebuild_after_flash: bool,
     debug_snapshot: DebugSnapshot,
     sent_program_generation: u64,
+    ai_service: Option<crate::ai_readonly::ReadService>,
+    ai_values: crate::ai_readonly::ReadState,
+    ai_writes: crate::ai_write::WriteController,
 }
 
 impl MemRW3App {
@@ -67,8 +74,20 @@ impl MemRW3App {
             repaint_ctx,
         );
 
+        let appearance = ui::workspace::AppearanceStore::new();
+        let mut dock = DockLayoutState::default();
+        // 布局先取本机上次使用的，再叠加本机外观。
+        if let Some(workspace) = ui::prefs::get().workspace {
+            dock.workspace = workspace;
+        }
+        appearance.restore(&mut dock.workspace);
+        dock.workspace.normalize();
         Self {
-            dock: DockLayoutState::default(),
+            dock,
+            side_panel: ui::side_panel::SidePanelState::default(),
+            appearance,
+            background: ui::workspace::Background::default(),
+            journal: ui::debug_tools::WriteJournal::default(),
             session,
             variable_tree: VariableTreePanel::new(dwarf_state),
             plugins: Self::default_plugins(),
@@ -85,7 +104,110 @@ impl MemRW3App {
             rebuild_after_flash: false,
             debug_snapshot: DebugSnapshot::default(),
             sent_program_generation: 0,
+            ai_service: None,
+            ai_values: crate::ai_readonly::ReadState::default(),
+            ai_writes: crate::ai_write::WriteController::default(),
         }
+    }
+
+    /// 把当前布局和侧栏开关记入本机偏好，由偏好模块防抖落盘。
+    fn remember_ui_prefs(&self) {
+        ui::prefs::update(|prefs| {
+            prefs.workspace = Some(self.dock.workspace.clone());
+            prefs.side_panel_open = Some(self.side_panel.open);
+            prefs.side_panel_width = Some(self.side_panel.width);
+        });
+    }
+
+    pub fn ai_interface_ready(&self) -> bool {
+        self.ai_service.is_some()
+    }
+
+    pub fn start_ai_interface(&mut self, ctx: &egui::Context) {
+        if self.ai_service.is_some() {
+            return;
+        }
+        match crate::ai_readonly::ReadService::start(ctx.clone()) {
+            Ok(service) => {
+                self.ai_writes.invalidate();
+                self.ai_values = crate::ai_readonly::ReadState::default();
+                self.ai_service = Some(service);
+            }
+            Err(error) => {
+                self.show_plugin_toast(ToastLevel::Error, format!("AI接口启动失败：{error}"))
+            }
+        }
+    }
+
+    fn process_ai_queries(&mut self, frame_data: &FrameData) {
+        let Some(service) = &self.ai_service else {
+            return;
+        };
+        self.ai_values
+            .observe(&self.session.config.pool, frame_data);
+        let status = serde_json::json!({
+            "session_id":service.session_id,"pid":std::process::id(),"readonly":!self.ai_writes.enabled(),
+            "server_version":"2.2.0","ai_write_enabled":self.ai_writes.enabled(),
+            "connection_pending":self.connection_pending,
+            "generated_at_ms":crate::ai_readonly::now_ms(),"connected":self.session.connected,
+            "running":self.session.is_running(),
+            "acquisition_requested":self.session.acquisition_requested.load(Ordering::Acquire),
+            "hardware_busy":self.is_flashing(),"target_halted":self.is_target_halted(),
+            "chart_paused":self.dock.is_plugin_paused("chart"),
+            "table_paused":self.dock.is_plugin_paused("table"),
+            "variable_count":self.session.config.pool.iter().count(),
+        });
+        let journal = &mut self.journal;
+        let writes = &mut self.ai_writes;
+        let next_id = &mut self.next_request_id;
+        let worker = &self.probe_worker;
+        service.process(|method, args, deadline| match method {
+            "get_write_permissions" => Ok(writes.permissions(&self.session.config.pool)),
+            "get_write_result" => writes.result(args),
+            "write_variable" => {
+                let id = *next_id;
+                *next_id = next_id.wrapping_add(1);
+                let result =
+                    writes.submit(args, &self.session.config.pool, &status, id, |mut spec| {
+                        spec.expires_at = deadline;
+                        worker.send(ProbeCommand::GuardedAiWrite { spec })
+                    });
+                if let Ok(record) = &result {
+                    if record["probe_request_id"].as_u64() == Some(id)
+                        && !journal.records.iter().any(|r| r.id == id)
+                    {
+                        journal.submitted(
+                            id,
+                            "AI",
+                            record["variable_name"]
+                                .as_str()
+                                .unwrap_or("未知变量")
+                                .into(),
+                            format!(
+                                "预期：{}",
+                                args["expected_value"].as_str().unwrap_or("未知")
+                            ),
+                            args["value"].as_str().unwrap_or("未知").into(),
+                        );
+                        if record["state"] != "pending" {
+                            journal.finished(
+                                id,
+                                Err(record["error"].as_str().unwrap_or("未提交").into()),
+                                false,
+                            );
+                        }
+                    }
+                }
+                result
+            }
+            _ => self.ai_values.query(
+                method,
+                args,
+                &self.session.config.pool,
+                &self.plugins,
+                &status,
+            ),
+        });
     }
 
     pub fn sync_connect(&mut self) {
@@ -97,6 +219,8 @@ impl MemRW3App {
         let speed = self.session.config.probe_speed_khz;
         let probe_id = self.session.probe_id.clone();
         let connected = self.session.connected;
+        self.ai_values = crate::ai_readonly::ReadState::default();
+        self.ai_writes.invalidate();
 
         if connected {
             self.session
@@ -126,6 +250,7 @@ impl MemRW3App {
     }
 
     pub fn sync_reset(&mut self) {
+        self.ai_writes.invalidate();
         if let Err(error) = self.probe_worker.send(ProbeCommand::Reset) {
             self.show_plugin_toast(ToastLevel::Error, error);
         }
@@ -144,6 +269,7 @@ impl MemRW3App {
     }
 
     pub fn start_flash_firmware(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        self.ai_writes.invalidate();
         if !self.session.connected {
             return Err("请先连接目标设备".to_owned());
         }
@@ -242,16 +368,35 @@ impl MemRW3App {
         };
         let addr = var.address;
         let size = var.size;
-        let request_id = self.next_request_id();
-        self.probe_worker
-            .send(ProbeCommand::WriteValue {
-                request_id,
-                address: addr,
-                size,
-                value,
-                kind: WriteKind::Variable,
+        let name = var.name.clone();
+        let kind = var.ext_type.clone();
+        let old = var
+            .latest
+            .load()
+            .map(|(_, raw)| {
+                ui::debug_tools::format_number(raw, &kind, ui::debug_tools::NumberFormat::Decimal)
             })
-            .is_ok()
+            .unwrap_or_else(|| "未知（无采样）".into());
+        let new = ui::debug_tools::format_number(
+            value.to_le_bytes(),
+            &kind,
+            ui::debug_tools::NumberFormat::Decimal,
+        );
+        let request_id = self.next_request_id();
+        self.journal.submitted(request_id, "手工", name, old, new);
+        match self.probe_worker.send(ProbeCommand::WriteValue {
+            request_id,
+            address: addr,
+            size,
+            value,
+            kind: WriteKind::Variable,
+        }) {
+            Ok(()) => true,
+            Err(error) => {
+                self.journal.finished(request_id, Err(error), false);
+                false
+            }
+        }
     }
 
     pub fn rebuild_slots(&self) {
@@ -321,6 +466,19 @@ impl MemRW3App {
         let mut rebuild_slots = false;
         for action in actions {
             match action {
+                PluginAction::AddToChart { variables } => {
+                    if let Some(chart) = self.plugins.iter_mut().find(|p| p.id() == "chart") {
+                        match chart.add_chart_variables(&variables, &mut self.session.config.pool) {
+                            Ok(changed) => {
+                                rebuild_slots |= changed;
+                                self.dock.focus_plugin("chart");
+                            }
+                            Err(error) => {
+                                self.toasts.error(error);
+                            }
+                        }
+                    }
+                }
                 PluginAction::OpenVariableTree {
                     plugin_id,
                     viewport_id,
@@ -430,6 +588,12 @@ impl MemRW3App {
                     rebuild_slots = true;
                 }
                 PluginAction::Debug(command) => {
+                    if matches!(
+                        &command,
+                        crate::model::DebugCommand::Start(crate::model::DebugStartMode::Reset)
+                    ) {
+                        self.ai_writes.invalidate();
+                    }
                     if self.is_flashing() {
                         self.toasts
                             .error("固件烧录期间不能执行调试命令")
@@ -507,6 +671,8 @@ impl MemRW3App {
                     }
                 }
                 ProbeEvent::Disconnected => {
+                    self.journal.cancel_pending("连接断开");
+                    self.ai_writes.invalidate();
                     self.connection_pending = false;
                     self.session.connected = false;
                     self.session.timer_was_started = false;
@@ -553,12 +719,58 @@ impl MemRW3App {
                         self.rebuild_slots();
                     }
                 }
+                ProbeEvent::AiWriteFinished {
+                    request_id,
+                    outcome,
+                } => {
+                    let message = if outcome.verified {
+                        "AI参数写入并读回确认".to_owned()
+                    } else {
+                        outcome
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "AI写入结果未确认".into())
+                    };
+                    let level = if outcome.verified {
+                        ToastLevel::Success
+                    } else {
+                        ToastLevel::Error
+                    };
+                    self.journal.finished(
+                        request_id,
+                        if outcome.verified {
+                            Ok(())
+                        } else {
+                            Err(outcome
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "写入结果未确认".into()))
+                        },
+                        outcome.verified,
+                    );
+                    if let Some(record) = self
+                        .journal
+                        .records
+                        .iter_mut()
+                        .rev()
+                        .find(|r| r.id == request_id)
+                    {
+                        if let Some(before) = outcome.before {
+                            record.old = format!("{}；实读原始位 0x{before:X}", record.old);
+                        }
+                        if let Some(after) = outcome.after {
+                            record.readback = format!("{}；原始位 0x{after:X}", record.readback);
+                        }
+                    }
+                    self.ai_writes.finish(request_id, outcome);
+                    self.show_plugin_toast(level, message);
+                }
                 ProbeEvent::WriteFinished {
                     request_id,
                     kind,
                     result,
                 } => {
-                    let _ = request_id;
+                    self.journal.finished(request_id, result.clone(), false);
                     match (kind, result) {
                         (WriteKind::Variable, Ok(())) => {
                             self.toasts
@@ -590,6 +802,8 @@ impl MemRW3App {
                     }
                 }
                 ProbeEvent::LinkLost(error) => {
+                    self.journal.cancel_pending("连接丢失");
+                    self.ai_writes.invalidate();
                     self.session.set_running(false);
                     self.session.connected = false;
                     self.session.timer_was_started = false;
@@ -630,6 +844,7 @@ impl MemRW3App {
         if generation == 0 || generation == self.sent_program_generation {
             return;
         }
+        self.ai_writes.invalidate();
         let Some(path) = self.variable_tree.loaded_elf_path() else {
             return;
         };
@@ -646,6 +861,16 @@ impl MemRW3App {
     }
 }
 
+impl Drop for MemRW3App {
+    fn drop(&mut self) {
+        let _ = self.appearance.flush(&self.dock.workspace);
+        self.remember_ui_prefs();
+        ui::prefs::flush();
+        self.ai_writes.shutdown();
+        self.ai_service = None;
+    }
+}
+
 impl eframe::App for MemRW3App {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         ui::set_native_dialog_parent(frame);
@@ -657,7 +882,8 @@ impl eframe::App for MemRW3App {
         }
         let running = self.session.is_running();
         if running {
-            ui.ctx().request_repaint();
+            ui.ctx()
+                .request_repaint_after(Duration::from_secs_f64(1.0 / 60.0));
         }
 
         let cycles = self.session.acq_cycle_count.load(Ordering::Relaxed);
@@ -699,15 +925,38 @@ impl eframe::App for MemRW3App {
                 egui_ctx: ui.ctx(),
             }));
         }
+        let annotations: Vec<_> = self
+            .plugins
+            .iter()
+            .flat_map(|p| p.readonly_annotations())
+            .collect();
+        for plugin in &mut self.plugins {
+            plugin.sync_annotations(&annotations);
+        }
         self.handle_plugin_actions(update_actions);
+        self.process_ai_queries(&frame_data);
+        self.side_panel
+            .update(&self.session.config.pool, &frame_data, &self.register_data);
+        self.register_data
+            .retain(|id, _| !self.side_panel.is_stale_memory_id(*id));
 
         let bs_open = self.variable_tree.is_open_in(ui.ctx().viewport_id());
         let dialog_open = self.plugins.iter().any(|plugin| plugin.is_dialog_open());
         let running = self.session.is_running();
         let interaction_enabled = !self.is_flashing();
 
+        self.journal.show(ui.ctx());
         let colors = ui::theme::palette(ui);
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new("workspace_opacity"),
+                self.dock.workspace.panel_opacity,
+            )
+        });
         egui::Frame::NONE.fill(colors.app_bg).show(ui, |ui| {
+            self.background
+                .paint(ui, self.dock.workspace.background_strength);
+            ui.visuals_mut().panel_fill = ui::theme::palette(ui).panel_bg;
             let shell_size = ui.available_size();
             let activity_w = 52.0;
             let (shell_rect, _) = ui.allocate_exact_size(shell_size, egui::Sense::hover());
@@ -715,12 +964,21 @@ impl eframe::App for MemRW3App {
                 shell_rect.min,
                 egui::vec2(activity_w, shell_rect.height()),
             );
-            let right_rect = egui::Rect::from_min_size(
+            // 窗口较窄时侧栏让出空间，保证工作区至少 420 像素。
+            let side_w = if self.side_panel.open {
+                self.side_panel
+                    .width
+                    .min((shell_rect.width() - activity_w - 420.0).max(0.0))
+            } else {
+                0.0
+            };
+            let side_rect = egui::Rect::from_min_size(
                 egui::pos2(activity_rect.max.x, shell_rect.min.y),
-                egui::vec2(
-                    (shell_rect.width() - activity_w).max(0.0),
-                    shell_rect.height(),
-                ),
+                egui::vec2(side_w, shell_rect.height()),
+            );
+            let right_rect = egui::Rect::from_min_max(
+                egui::pos2(side_rect.max.x, shell_rect.min.y),
+                shell_rect.max,
             );
 
             let mut activity_ui = ui.new_child(
@@ -729,7 +987,62 @@ impl eframe::App for MemRW3App {
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
             activity_ui.set_clip_rect(activity_rect);
-            ui::dock::show_plugin_activity_bar(&mut activity_ui, &mut self.dock, &mut self.plugins);
+            ui::dock::show_plugin_activity_bar(
+                &mut activity_ui,
+                &mut self.dock,
+                &mut self.plugins,
+                &mut self.side_panel.open,
+            );
+
+            if side_w >= 120.0 {
+                let mut side_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("side_panel")
+                        .max_rect(side_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                side_ui.set_clip_rect(side_rect);
+                let output = self.side_panel.show(
+                    &mut side_ui,
+                    ui::side_panel::SideContext {
+                        pool: &self.session.config.pool,
+                        annotations: &annotations,
+                        status: ui::side_panel::StatusInput {
+                            connected: self.session.connected,
+                            connection_pending: self.connection_pending,
+                            flashing: self.flashing,
+                            acquisition_requested: self
+                                .session
+                                .acquisition_requested
+                                .load(Ordering::Acquire),
+                            running,
+                            sampling_hz: self.session.sampling_hz,
+                            debug_active: self.debug_snapshot.active,
+                            target_state: &self.debug_snapshot.target_state,
+                        },
+                        snapshot: &self.debug_snapshot,
+                        elf_path: &self.variable_tree.elf_path,
+                        chip: &self.session.config.probe_chip,
+                    },
+                );
+                if let Some(panel) = output.show_panel {
+                    self.dock.focus_plugin(panel);
+                }
+                self.handle_plugin_actions(output.actions);
+                // 侧栏右边缘可拖动调整宽度。
+                let grip = egui::Rect::from_min_max(
+                    egui::pos2(side_rect.max.x - 3.0, side_rect.min.y),
+                    egui::pos2(side_rect.max.x + 3.0, side_rect.max.y),
+                );
+                let drag = ui
+                    .interact(grip, ui.id().with("side_panel_grip"), egui::Sense::drag())
+                    .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                if drag.dragged() {
+                    let range = ui::side_panel::WIDTH_RANGE;
+                    self.side_panel.width = (side_w + ui.input(|i| i.pointer.delta().x))
+                        .clamp(*range.start(), *range.end());
+                }
+            }
 
             let mut right_ui = ui.new_child(
                 egui::UiBuilder::new()
@@ -742,6 +1055,14 @@ impl eframe::App for MemRW3App {
                     ui::control_bar(ui, self);
                 });
 
+                ui.horizontal_wrapped(|ui| {
+                    if self.dock.workspace.controls(ui) {
+                        self.dock.restore_regions();
+                    }
+                    if ui.button("参数修改记录").clicked() {
+                        self.journal.open = true;
+                    }
+                });
                 let dock_h = ui.available_height();
                 if dock_h > 0.0 {
                     let pool = &mut self.session.config.pool;
@@ -786,6 +1107,19 @@ impl eframe::App for MemRW3App {
         if let Some(file_name) = self.flashing_file_name.as_deref() {
             firmware_flash_modal(ui.ctx(), file_name);
         }
+        self.appearance.poll(&self.dock.workspace, ui.ctx());
+        self.remember_ui_prefs();
+        ui::prefs::poll(ui.ctx());
+        let prefs_error = ui::prefs::error();
+        if let Some(error) = self.appearance.error.as_ref().or(prefs_error.as_ref()) {
+            egui::Area::new(egui::Id::new("appearance_save_error"))
+                .anchor(egui::Align2::LEFT_BOTTOM, [8.0, -8.0])
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.colored_label(ui.visuals().warn_fg_color, error);
+                    });
+                });
+        }
         self.toasts.show(ui.ctx());
     }
 }
@@ -807,6 +1141,11 @@ fn firmware_flash_modal(ctx: &egui::Context, file_name: &str) {
 
 #[derive(Serialize, Deserialize)]
 struct SaveConfig {
+    // 旧配置没有布局时保持当前布局不变。
+    #[serde(default)]
+    workspace: Option<ui::workspace::WorkspaceSettings>,
+    #[serde(default)]
+    sidebar: Option<ui::side_panel::SavedSidePanel>,
     elf_path: String,
     probe_chip: String,
     probe_protocol: String,
@@ -832,6 +1171,8 @@ impl MemRW3App {
         let Some(path) = path else { return };
 
         let config = SaveConfig {
+            workspace: Some(self.dock.workspace.clone()),
+            sidebar: Some(self.side_panel.to_saved()),
             elf_path: self.variable_tree.elf_path.clone(),
             probe_chip: self.session.config.probe_chip.clone(),
             probe_protocol: self.session.config.probe_protocol.clone(),
@@ -959,10 +1300,20 @@ impl MemRW3App {
                 }
             };
 
+        if let Some(workspace) = config.workspace {
+            self.dock.workspace = workspace;
+        }
+        self.appearance.restore(&mut self.dock.workspace);
+        self.dock.workspace.normalize();
+        self.dock.restore_regions();
+        self.side_panel
+            .load_saved(config.sidebar.unwrap_or_default());
         self.session.config.probe_chip = config.probe_chip;
         self.session.config.probe_protocol = config.probe_protocol;
         self.session.config.probe_speed_khz = config.probe_speed_khz;
+        self.ai_writes.invalidate();
         self.session.config.pool = new_pool;
+        self.ai_values = crate::ai_readonly::ReadState::default();
         let request_id = self.next_request_id();
         let _ = self.probe_worker.send(ProbeCommand::Debug {
             request_id,
@@ -1154,5 +1505,196 @@ mod font_tests {
             family_preference_rank(&fallback),
             PREFERRED_CHINESE_FAMILIES.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod local_ui_config_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires MEMRW3_CONFIG_DIR with local JSON fixtures; no hardware"]
+    fn local_three_configs_roundtrip_without_changing_variable_identity() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("MEMRW3_CONFIG_DIR").expect("fixture directory"),
+        );
+        for filename in [
+            "memrw3_config.json",
+            "MemRW3_变力调参.json",
+            "MemRW3_上膛调参.json",
+        ] {
+            let text = std::fs::read_to_string(root.join(filename)).unwrap();
+            let config: SaveConfig = serde_json::from_str(&text).unwrap();
+            let mut pool = VariablePool::default();
+            for variable in &config.variables {
+                pool.add(&dwarf::types::ExtendConfig {
+                    name: variable.name.clone(),
+                    address: variable.address,
+                    ext_type: variable.ext_type.clone(),
+                    size: variable.size,
+                    array_index: None,
+                    array_count: None,
+                });
+            }
+            let identity = |pool: &VariablePool| {
+                pool.iter()
+                    .map(|v| {
+                        (
+                            v.name.clone(),
+                            v.address,
+                            format!("{:?}", v.ext_type),
+                            v.size,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = identity(&pool);
+            let mut plugins = MemRW3App::default_plugins();
+            for saved in &config.plugins {
+                if let Some(plugin) = plugins.iter_mut().find(|p| p.id() == saved.plugin_id) {
+                    plugin.load_config(&saved.payload, &mut pool).unwrap();
+                    let roundtrip = plugin.save_config(&pool);
+                    plugin.load_config(&roundtrip, &mut pool).unwrap();
+                }
+            }
+            assert_eq!(before, identity(&pool), "{filename}");
+            let reader = crate::ai_readonly::ReadState::default();
+            let exported = reader
+                .query(
+                    "list_variables",
+                    &serde_json::json!({"limit":200}),
+                    &pool,
+                    &plugins,
+                    &serde_json::json!({"connected":false,"running":false}),
+                )
+                .unwrap();
+            assert_eq!(exported["total"].as_u64().unwrap() as usize, before.len());
+            assert!(
+                exported["variables"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| !v["comment"].as_str().unwrap_or("").is_empty()),
+                "Chinese comments must reach the AI interface"
+            );
+            let first = pool.iter().next().unwrap().id;
+            let unread = reader
+                .query(
+                    "read_variables",
+                    &serde_json::json!({"ids":[first]}),
+                    &pool,
+                    &plugins,
+                    &serde_json::json!({"connected":false,"running":false}),
+                )
+                .unwrap();
+            assert_eq!(unread["variables"][0]["has_sample"], false);
+
+            eprintln!(
+                "config compatibility: {filename}, {} variables",
+                before.len()
+            );
+        }
+    }
+
+    /// 旧节点里的每个字段，在新版本保存后必须原样保留；旧式“名称 ｜ 注释”拆成两个字段。
+    fn assert_table_node_kept(old: &serde_json::Value, new: &serde_json::Value, file: &str) {
+        let (label, comment) = match old.get("comment").and_then(|c| c.as_str()) {
+            Some(comment) => (
+                old["label"].as_str().unwrap().to_owned(),
+                comment.to_owned(),
+            ),
+            None => crate::ui::table_plugin::split_legacy_comment(old["label"].as_str().unwrap()),
+        };
+        assert_eq!(new["label"], label, "{file}");
+        assert_eq!(new["comment"], comment, "{file}");
+        for key in ["source_name", "source_address", "expanded"] {
+            assert_eq!(new[key], old[key], "{file} {key}");
+        }
+        if !old["variable"].is_null() {
+            for (key, value) in old["variable"].as_object().unwrap() {
+                assert_eq!(&new["variable"][key], value, "{file} variable.{key}");
+            }
+        }
+        let empty = Vec::new();
+        let old_children = old["children"].as_array().unwrap_or(&empty);
+        let new_children = new["children"].as_array().unwrap_or(&empty);
+        assert_eq!(old_children.len(), new_children.len(), "{file}");
+        for (old, new) in old_children.iter().zip(new_children) {
+            assert_table_node_kept(old, new, file);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires MEMRW3_CONFIG_FILES listing local JSON configs; no hardware"]
+    fn existing_config_files_load_and_keep_names_comments_and_layout() {
+        let files = std::env::var("MEMRW3_CONFIG_FILES").expect("config file list");
+        for file in files.split(';').filter(|f| !f.trim().is_empty()) {
+            let text = std::fs::read_to_string(file).unwrap();
+            let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let config: SaveConfig = serde_json::from_str(&text).unwrap();
+            // 没有布局字段的旧配置不改变当前布局；有的原样读回。
+            assert_eq!(config.workspace.is_some(), raw.get("workspace").is_some());
+            if let Some(mut workspace) = config.workspace.clone() {
+                workspace.normalize();
+                for key in ["chart_on_top", "order"] {
+                    assert_eq!(
+                        serde_json::to_value(&workspace).unwrap()[key],
+                        raw["workspace"][key],
+                        "{file} workspace.{key}"
+                    );
+                }
+            }
+            assert!(config.sidebar.is_none(), "{file} 是旧配置，不应有侧栏字段");
+            let mut pool = VariablePool::default();
+            for variable in &config.variables {
+                pool.add(&dwarf::types::ExtendConfig {
+                    name: variable.name.clone(),
+                    address: variable.address,
+                    ext_type: variable.ext_type.clone(),
+                    size: variable.size,
+                    array_index: None,
+                    array_count: None,
+                });
+            }
+            let mut plugins = MemRW3App::default_plugins();
+            let mut checked = (0, 0);
+            for saved in &config.plugins {
+                let plugin = plugins
+                    .iter_mut()
+                    .find(|p| p.id() == saved.plugin_id)
+                    .unwrap_or_else(|| panic!("{file} 未知插件 {}", saved.plugin_id));
+                plugin.load_config(&saved.payload, &mut pool).unwrap();
+                let resaved = plugin.save_config(&pool);
+                match saved.plugin_id.as_str() {
+                    "table" => {
+                        let old_roots = saved.payload["roots"].as_array().unwrap();
+                        let new_roots = resaved["roots"].as_array().unwrap();
+                        assert_eq!(old_roots.len(), new_roots.len(), "{file}");
+                        for (old, new) in old_roots.iter().zip(new_roots) {
+                            assert_table_node_kept(old, new, file);
+                        }
+                        checked.0 = old_roots.len();
+                    }
+                    "chart" => {
+                        let old_legends = saved.payload["legends"].as_array().unwrap();
+                        let new_legends = resaved["legends"].as_array().unwrap();
+                        assert_eq!(old_legends.len(), new_legends.len(), "{file}");
+                        for (old, new) in old_legends.iter().zip(new_legends) {
+                            for (key, value) in old.as_object().unwrap() {
+                                assert_eq!(&new[key], value, "{file} legend.{key}");
+                            }
+                        }
+                        checked.1 = old_legends.len();
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!(
+                "config kept: {file}, {} variables, {} table roots, {} legends",
+                config.variables.len(),
+                checked.0,
+                checked.1
+            );
+        }
     }
 }

@@ -428,6 +428,51 @@ impl ProbeSession {
         }
     }
 
+    pub fn guarded_ai_write(
+        &mut self,
+        spec: &crate::ai_write::WriteSpec,
+    ) -> crate::ai_write::WriteOutcome {
+        use crate::ai_write::{Access, WriteOutcome, guarded_io};
+        use std::sync::atomic::Ordering;
+        if !self.connected
+            || !spec.gate.load(Ordering::Acquire)
+            || std::time::Instant::now() >= spec.expires_at
+        {
+            return WriteOutcome::rejected("target disconnected or write permission revoked");
+        }
+        let core = match self.core_mut() {
+            Ok(core) => core,
+            Err(error) => return WriteOutcome::rejected(error.to_string()),
+        };
+        guarded_io(
+            spec.size,
+            spec.expected,
+            spec.value,
+            &spec.gate,
+            spec.expires_at,
+            |action| {
+                match action {
+                    Access::Read => match spec.size {
+                        1 => core.read_word_8(spec.address).map(u64::from),
+                        2 => core.read_word_16(spec.address).map(u64::from),
+                        4 => core.read_word_32(spec.address).map(u64::from),
+                        8 => core.read_word_64(spec.address),
+                        _ => unreachable!(),
+                    },
+                    Access::Write(value) => match spec.size {
+                        1 => core.write_word_8(spec.address, value as u8),
+                        2 => core.write_word_16(spec.address, value as u16),
+                        4 => core.write_word_32(spec.address, value as u32),
+                        8 => core.write_word_64(spec.address, value),
+                        _ => unreachable!(),
+                    }
+                    .map(|()| 0),
+                }
+                .map_err(|error| error.to_string())
+            },
+        )
+    }
+
     /// Read a group of SVD registers while holding one probe core handle.
     /// Individual failures are returned without cancelling the remaining reads.
     pub fn read_registers(

@@ -19,11 +19,18 @@ pub struct TableLeaf {
     pub edit_buffer: String,
     pub refresh_hz: u32,
     last_value_update: Option<Instant>,
+    pub raw: Option<[u8; 8]>,
+    pub changed_at: Option<Instant>,
+    pub sample_at: Option<Instant>,
+    last_sequence: u64,
 }
 
 pub struct TableNode {
     pub id: u64,
     pub label: String,
+    pub comment: String,
+    pub comment_edit: Option<String>,
+    pub comment_focus: bool,
     pub source_name: String,
     pub source_address: u64,
     pub expanded: bool,
@@ -43,6 +50,9 @@ impl TableNode {
             return Err(format!("{} 中没有可读取的标量字段", candidate.name));
         }
         root.label = root_label;
+        let (label, comment) = split_legacy_comment(&root.label);
+        root.label = label;
+        root.comment = comment;
         Ok(root)
     }
 
@@ -68,6 +78,10 @@ impl TableNode {
                 edit_buffer: String::new(),
                 refresh_hz: default_refresh_hz(),
                 last_value_update: None,
+                raw: None,
+                changed_at: None,
+                sample_at: None,
+                last_sequence: 0,
             }
         });
         let children = candidate
@@ -79,6 +93,9 @@ impl TableNode {
         Self {
             id,
             label: candidate.label.clone(),
+            comment: String::new(),
+            comment_edit: None,
+            comment_focus: false,
             source_name: candidate.name.clone(),
             source_address: candidate.address,
             expanded: !candidate.children.is_empty(),
@@ -94,6 +111,10 @@ impl TableNode {
     ) -> Result<Self, String> {
         let id = *next_id;
         *next_id = next_id.saturating_add(1);
+        let (label, comment) = match saved.comment {
+            Some(comment) => (saved.label, comment),
+            None => split_legacy_comment(&saved.label),
+        };
         let leaf = match saved.variable {
             Some(saved_leaf) => {
                 let variable_id = saved_leaf
@@ -124,6 +145,10 @@ impl TableNode {
                     edit_buffer: String::new(),
                     refresh_hz: saved_leaf.refresh_hz.clamp(1, 60),
                     last_value_update: None,
+                    raw: None,
+                    changed_at: None,
+                    sample_at: None,
+                    last_sequence: 0,
                 })
             }
             None => None,
@@ -136,7 +161,10 @@ impl TableNode {
 
         Ok(Self {
             id,
-            label: saved.label,
+            label,
+            comment,
+            comment_edit: None,
+            comment_focus: false,
             source_name: saved.source_name,
             source_address: saved.source_address,
             expanded: saved.expanded,
@@ -158,6 +186,7 @@ impl TableNode {
         });
         SavedTableNode {
             label: self.label.clone(),
+            comment: Some(self.comment.clone()),
             source_name: self.source_name.clone(),
             source_address: self.source_address,
             expanded: self.expanded,
@@ -233,13 +262,27 @@ impl TableNode {
                     .is_none_or(|last_update| last_update.elapsed() >= interval);
                 if due {
                     if let Some(variable) = pool.get(leaf.variable_id) {
-                        let latest = variable.latest.load().map(|(_, raw)| raw).or_else(|| {
-                            frame_data
-                                .get(&leaf.variable_id)
-                                .and_then(|samples| samples.last())
-                                .map(|(_, raw)| *raw)
-                        });
+                        let latest = variable
+                            .latest
+                            .load()
+                            .map(|(sequence, raw)| {
+                                if sequence != leaf.last_sequence {
+                                    leaf.last_sequence = sequence;
+                                    leaf.sample_at = Some(Instant::now());
+                                }
+                                raw
+                            })
+                            .or_else(|| {
+                                frame_data
+                                    .get(&leaf.variable_id)
+                                    .and_then(|samples| samples.last())
+                                    .map(|(_, raw)| *raw)
+                            });
                         if let Some(raw) = latest {
+                            if leaf.raw.is_some_and(|previous| previous != raw) {
+                                leaf.changed_at = Some(Instant::now());
+                            }
+                            leaf.raw = Some(raw);
                             formatter(&raw, &variable.ext_type, &mut leaf.current_value);
                             leaf.last_value_update = Some(Instant::now());
                         }
@@ -257,6 +300,10 @@ impl TableNode {
             leaf.current_value.clear();
             leaf.current_value.push_str("--");
             leaf.last_value_update = None;
+            leaf.raw = None;
+            leaf.changed_at = None;
+            leaf.sample_at = None;
+            leaf.last_sequence = 0;
         }
         for child in &mut self.children {
             child.reset_values();
@@ -268,9 +315,45 @@ impl TableNode {
     }
 }
 
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+    use crate::dwarf::types::ExtendType;
+    #[test]
+    fn initial_sample_is_not_a_change_and_repeated_sequence_is_not_fresh() {
+        let mut pool = VariablePool::default();
+        let candidate = VariableCandidate {
+            label: "kp".into(),
+            name: "motor.kp".into(),
+            address: 0x20000000,
+            ext_type: ExtendType::U32,
+            size: 4,
+            children: vec![],
+        };
+        let mut node =
+            TableNode::from_candidate(&candidate, "kp".into(), &mut pool, &mut 0).unwrap();
+        let id = node.leaf.as_ref().unwrap().variable_id;
+        pool.get(id).unwrap().latest.store(1u64.to_le_bytes());
+        node.update_values(&pool, &FrameData::default(), |_, _, _| {});
+        assert!(node.leaf.as_ref().unwrap().changed_at.is_none());
+        let first = node.leaf.as_ref().unwrap().sample_at;
+        node.leaf.as_mut().unwrap().last_value_update = None;
+        node.update_values(&pool, &FrameData::default(), |_, _, _| {});
+        assert_eq!(node.leaf.as_ref().unwrap().sample_at, first);
+        pool.get(id).unwrap().latest.store(2u64.to_le_bytes());
+        node.leaf.as_mut().unwrap().last_value_update = None;
+        node.update_values(&pool, &FrameData::default(), |_, _, _| {});
+        assert!(node.leaf.as_ref().unwrap().changed_at.is_some());
+        node.reset_values();
+        assert!(node.leaf.as_ref().unwrap().raw.is_none());
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SavedTableNode {
     pub label: String,
+    #[serde(default)]
+    pub comment: Option<String>,
     pub source_name: String,
     pub source_address: u64,
     #[serde(default = "default_expanded")]
@@ -278,6 +361,16 @@ pub struct SavedTableNode {
     pub variable: Option<SavedTableLeaf>,
     #[serde(default)]
     pub children: Vec<SavedTableNode>,
+}
+
+/// Only explicit spaced separators are migrated; expression pipes stay intact.
+pub fn split_legacy_comment(label: &str) -> (String, String) {
+    for separator in [" ｜ ", " | "] {
+        if let Some((name, comment)) = label.split_once(separator) {
+            return (name.trim().to_owned(), comment.trim().to_owned());
+        }
+    }
+    (label.to_owned(), String::new())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -470,5 +563,42 @@ mod tests {
                 .sum::<usize>(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod comment_compatibility_tests {
+    use super::*;
+    #[test]
+    fn splits_explicit_comment_but_not_expression_pipe() {
+        assert_eq!(
+            split_legacy_comment("kp ｜ 比例系数"),
+            ("kp".into(), "比例系数".into())
+        );
+        assert_eq!(
+            split_legacy_comment("kp | 比例系数"),
+            ("kp".into(), "比例系数".into())
+        );
+        assert_eq!(
+            split_legacy_comment("flags|mask"),
+            ("flags|mask".into(), String::new())
+        );
+    }
+    #[test]
+    fn legacy_comment_and_explicit_empty_survive_roundtrip() {
+        let input = serde_json::json!({"label":"kp ｜ 比例系数", "source_name":"motor.kp", "source_address":536870912u64, "variable":null, "children":[]});
+        let mut pool = VariablePool::default();
+        let mut id = 1;
+        let saved: SavedTableNode = serde_json::from_value(input).unwrap();
+        let mut node = TableNode::from_saved(saved, &mut pool, &mut id).unwrap();
+        assert_eq!(node.comment, "比例系数");
+        assert_eq!(node.source_name, "motor.kp");
+        assert_eq!(node.source_address, 536870912);
+        node.comment.clear();
+        node.label = "kp ｜ 用户保留的别名".into();
+        let saved = node.to_saved(&pool);
+        let again = TableNode::from_saved(saved, &mut pool, &mut id).unwrap();
+        assert_eq!(again.comment, "");
+        assert_eq!(again.label, "kp ｜ 用户保留的别名");
     }
 }
