@@ -58,7 +58,7 @@ try {
 
 保留 Watch 表格、完整曲线历史、粉色图标和原有 Debug 调试器。源码修改和编译请在外部 IDE 进行。
 
-GitHub: https://github.com/RP27-EC/MemRW3
+GitHub: https://github.com/Sering-Hong/MemRW3
 '@ | Set-Content -LiteralPath (Join-Path $stage 'README.md') -Encoding UTF8
     $sourceOut = Join-Path $stage 'source'
     $tracked = @(Invoke-Native -FilePath 'git.exe' -Arguments @('-c', 'core.quotepath=false', 'ls-files') -Capture)
@@ -71,7 +71,7 @@ GitHub: https://github.com/RP27-EC/MemRW3
     @{
         name = 'MemRW3'; edition = 'Enhanced Pink'; base_version = 'v2.2.1'
         packaged_date = (Get-Date -Format 'yyyy-MM-dd'); portable = $true
-        repository = 'https://github.com/RP27-EC/MemRW3'
+        repository = 'https://github.com/Sering-Hong/MemRW3'
         executable_sha256 = (Get-FileHash -LiteralPath (Join-Path $stage 'MemRW3.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'package-info.json') -Encoding UTF8
     $prefix = $stage.TrimEnd('\') + '\'

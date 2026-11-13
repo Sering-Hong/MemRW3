@@ -10,9 +10,9 @@
 AppId={{59C6A927-5D9C-4E41-80B3-BC623BB3C81B}
 AppName=MemRW3
 AppVersion={#AppVersion}
-AppPublisher=RP27-EC
-AppPublisherURL=https://github.com/RP27-EC/MemRW3
-AppSupportURL=https://github.com/RP27-EC/MemRW3/issues
+AppPublisher=Sering-Hong
+AppPublisherURL=https://github.com/Sering-Hong/MemRW3
+AppSupportURL=https://github.com/Sering-Hong/MemRW3/issues
 DefaultDirName={code:DefaultInstallDirectory}
 DefaultGroupName=MemRW3
 PrivilegesRequired=lowest

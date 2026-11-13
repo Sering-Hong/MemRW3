@@ -42,7 +42,7 @@
 
 ## Windows 一键安装
 
-从 [Releases](https://github.com/RP27-EC/MemRW3/releases) 下载 `MemRW3-Setup-2.2.1-pink.1-x64.exe`，双击后点击“安装”。安装前自动检测系统、实际 DLL 依赖和图形初始化；缺少依赖时停止并显示处理方法。自动创建粉色桌面、开始菜单及卸载入口。首次优先安装到 `D:\MemRW3`，也可更改目录。详见[安装说明](docs/安装说明.md)。
+从 [Releases](https://github.com/Sering-Hong/MemRW3/releases) 下载 `MemRW3-Setup-2.2.1-pink.1-x64.exe`，双击后点击“安装”。安装前自动检测系统、实际 DLL 依赖和图形初始化；缺少依赖时停止并显示处理方法。自动创建粉色桌面、开始菜单及卸载入口。首次优先安装到 `D:\MemRW3`，也可更改目录。详见[安装说明](docs/安装说明.md)。
 
 ## 第一次使用
 
@@ -69,7 +69,7 @@
 使用当前稳定版 Rust，保留 `Cargo.lock`。项目采用 Rust 2024 edition；`Cargo.toml` 中声明的 1.85 是项目最低声明值，锁定的依赖可能需要更高版本，不能据此保证 Rust 1.85 可编译。当前 Windows 实际验证工具链为 Rust 1.99.1 / GNU。
 
 ```bash
-git clone https://github.com/RP27-EC/MemRW3.git
+git clone https://github.com/Sering-Hong/MemRW3.git
 cd MemRW3
 cargo build --release --locked
 cargo test --release --locked
@@ -86,4 +86,4 @@ Windows 输出 `target/release/MemRW3.exe`；Linux/macOS 输出 `target/release/
 
 ## 来源与许可
 
-保留原项目提交历史及作者信息。上游 README 标注为 MIT，参见[保留的上游说明](docs/上游使用说明.md#许可证)。本仓库的增强重点是变量表、完整采样历史与图标；原有探针、固件烧录及 Debug 核心来自上游。图标生成提示词保存在 `assets/icon-prompt.txt`。
+保留原项目提交历史及作者信息。上游 README 标注为 MIT，本仓库按 MIT 发布，见 [LICENSE](LICENSE)；上游原文参见[保留的上游说明](docs/上游使用说明.md#许可证)。本仓库的增强重点是变量表、完整采样历史与图标；原有探针、固件烧录及 Debug 核心来自上游。图标生成提示词保存在 `assets/icon-prompt.txt`。
