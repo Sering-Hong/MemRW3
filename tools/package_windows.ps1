@@ -51,10 +51,18 @@ try {
     Copy-Item -LiteralPath (Join-Path $repo 'docs\使用说明.md') -Destination (Join-Path $stage '使用说明.md')
     Copy-Item -LiteralPath (Join-Path $repo 'docs\项目技术文档.md') -Destination (Join-Path $stage '项目技术文档.md')
     Copy-Item -LiteralPath (Join-Path $repo 'CHANGELOG.md') -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $repo 'ARCHITECTURE.md') -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $repo 'docs\开始使用.md') -Destination (Join-Path $stage '开始使用.md')
+    # 包内保留完整文档和 MCP 工具，Claude/Codex 配置指向 tools\memrw3_mcp.py。
+    Copy-Item -LiteralPath (Join-Path $repo 'docs') -Destination (Join-Path $stage 'docs') -Recurse
+    New-Item -ItemType Directory -Path (Join-Path $stage 'tools') | Out-Null
+    foreach ($tool in @('memrw3_mcp.py', 'pid_online.py')) {
+        Copy-Item -LiteralPath (Join-Path $repo "tools\$tool") -Destination (Join-Path $stage 'tools')
+    }
     @'
 # MemRW3 Enhanced Pink
 
-运行 MemRW3.exe，详细步骤见“使用说明.md”。完整源码、技术及构建说明见 source/README.md。
+运行 MemRW3.exe，先看“开始使用.md”，详细步骤见“使用说明.md”。完整源码、技术及构建说明见 source/README.md。
 
 保留 Watch 表格、完整曲线历史、粉色图标和原有 Debug 调试器。源码修改和编译请在外部 IDE 进行。
 
