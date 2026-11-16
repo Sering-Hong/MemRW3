@@ -44,6 +44,8 @@
 
 从 [Releases](https://github.com/Sering-Hong/MemRW3/releases) 下载 `MemRW3-Setup-2.2.1-pink.1-x64.exe`，双击后点击“安装”。安装前自动检测系统、实际 DLL 依赖和图形初始化；缺少依赖时停止并显示处理方法。自动创建粉色桌面、开始菜单及卸载入口。首次优先安装到 `D:\MemRW3`，也可更改目录。详见[安装说明](docs/安装说明.md)。
 
+便携版：Windows 下载 `MemRW3-windows.zip` 解压即用；Ubuntu 22.04 及更新版本下载 `MemRW3-linux-x86_64.tar.gz`，见 [Linux 使用说明](docs/Linux使用说明.md)。
+
 ## 第一次使用
 
 1. Windows 便携版解压后运行 `MemRW3.exe`。本地部署目录为 `D:\MemRW3`。

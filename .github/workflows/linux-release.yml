@@ -1,0 +1,58 @@
+name: Linux release (Ubuntu 22.04)
+
+# 在 22.04 上编译，glibc 2.35，22.04 及更新的 Ubuntu 都能运行。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要上传到的 Release tag，例如 v2.2.1-pink.2
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      # 用 main 构建；tag 之后只改了文档和 CI，程序源码相同。
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libudev-dev libusb-1.0-0-dev libx11-dev libxkbcommon-dev libwayland-dev libssl-dev
+      - name: Install current stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --release --locked
+      - name: Package
+        run: |
+          set -euo pipefail
+          name=MemRW3-linux-x86_64
+          stage="dist/$name"
+          rm -rf dist && mkdir -p "$stage/tools" "$stage/assets"
+          install -m 755 target/release/MemRW3 "$stage/MemRW3"
+          strip "$stage/MemRW3"
+          cp docs/Linux使用说明.md "$stage/开始使用-Linux.md"
+          cp docs/开始使用.md README.md CHANGELOG.md LICENSE "$stage/"
+          cp -r docs "$stage/docs"
+          cp tools/memrw3_mcp.py tools/pid_online.py "$stage/tools/"
+          cp assets/MemRW3-pink.png "$stage/assets/"
+          echo "--- 最高 glibc 符号版本"
+          objdump -T "$stage/MemRW3" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          echo "--- 动态库"
+          ldd "$stage/MemRW3"
+          (cd "$stage" && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" && cat "$name.tar.gz.sha256")
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag }}" dist/MemRW3-linux-x86_64.tar.gz dist/MemRW3-linux-x86_64.tar.gz.sha256 --clobber
